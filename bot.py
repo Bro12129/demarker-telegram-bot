@@ -181,4 +181,4 @@ async def worker():
             await asyncio.sleep(JOB_EVERY_SECONDS)
 
 if __name__ == "__main__":
-    asyncio.run(worker())
+    asyncio.run(worker()) 
