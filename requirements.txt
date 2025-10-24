@@ -1,7 +1,7 @@
-requests
-python-dotenv
-pandas==2.1.4
-numpy==1.26.0
+python-dotenv==1.0.1
+pandas==2.0.3
+numpy==1.24.4
 ccxt==4.1.87
-ta==0.11.0
-python-telegram-bot==13.15 
+ta==0.10.2
+python-telegram-bot==13.15
+requests
