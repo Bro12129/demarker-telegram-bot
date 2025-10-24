@@ -1,5 +1,5 @@
-# DeMarker(28) screener 4h + 1d → Telegram
-# Перпетуалы (swap) Bybit/USDT. Render/Py3.13 совместимо. Без imghdr.
+# DeMarker(28) screener → Telegram (hard mode: only numbers & symbols)
+# Bybit linear USDT swaps, TF: 4h & 1d. Python 3.10–3.13, без imghdr.
 import os, time, json
 from pathlib import Path
 from datetime import datetime, timezone
@@ -12,24 +12,32 @@ from telegram import Bot
 
 # ───────────────── ENV ─────────────────
 load_dotenv()
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("TG_CHAT_ID")   or os.getenv("TELEGRAM_CHAT_ID")   or os.getenv("CHAT_ID")
-if not BOT_TOKEN: raise RuntimeError("TG_BOT_TOKEN/TELEGRAM_BOT_TOKEN не задан")
-if not CHAT_ID:   raise RuntimeError("TG_CHAT_ID/TELEGRAM_CHAT_ID не задан")
+BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+             or os.getenv("BOT_TOKEN"))
+CHAT_ID   = (os.getenv("TG_CHAT_ID")   or os.getenv("TELEGRAM_CHAT_ID")
+             or os.getenv("CHAT_ID"))
+if not BOT_TOKEN:
+    raise RuntimeError("TG_BOT_TOKEN/TELEGRAM_BOT_TOKEN/BOT_TOKEN не задан")
+if not CHAT_ID:
+    raise RuntimeError("TG_CHAT_ID/TELEGRAM_CHAT_ID/CHAT_ID не задан")
 bot = Bot(token=BOT_TOKEN)
 
 # ─────────────── CONFIG ───────────────
-TIMEFRAMES       = ["4h", "1d"]       # два ТФ
+TIMEFRAMES       = ["4h", "1d"]
 DEM_PERIOD       = 28
 OVERSOLD         = 0.30
 OVERBOUGHT       = 0.70
+EXT_OVERSOLD     = 0.20     # «жёсткие» экстремы
+EXT_OVERBOUGHT   = 0.80
 OHLCV_LIMIT      = 300
-INTERVAL_SECONDS = 900                # цикл каждые 15 минут
+INTERVAL_SECONDS = 900       # каждые 15 минут
 STATE_FILE       = Path("alerts_state.json")
 
-UP = "🟢⬆️"; DOWN = "🔴⬇️"; CANDLE = "🕯"
+UP = "🟢⬆️"; DOWN = "🔴⬇️"
+LGT = "⚡"; DLGT = "⚡⚡"      # одиночная/двойная молния
+CANDLE = "🕯"                 # используется только внутр. логикой
 
-# Желаемые базы (подбираем реальные своп-символы автоматически)
+# базовые активы для первичного подбора; далее дополним до ~45 символов
 DESIRED_BASES = [
     "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","DOT","AVAX","MATIC","LINK","LTC",
     "BCH","ATOM","XMR","APT","ARB","OP","NEAR","FIL","ETC","ICP","SUI","HBAR","UNI","TIA","XLM",
@@ -39,16 +47,16 @@ DESIRED_BASES = [
 # ───────────── EXCHANGE ───────────────
 exchange = ccxt.bybit({
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"}   # перпетуалы
+    "options": {"defaultType": "swap"}
 })
 markets = exchange.load_markets()
 
 def resolve_symbols(desired_bases):
     syms = []
     for m in markets.values():
-        if not m.get("swap"):                 # только перпы
+        if not m.get("swap"):
             continue
-        if m.get("linear") is False:          # предпочитаем линейные USDT
+        if m.get("linear") is False:
             continue
         base = str(m.get("base","")).upper()
         symbol = m.get("symbol","")
@@ -96,115 +104,154 @@ def add_demarker(df, period=DEM_PERIOD):
     df["demarker"] = a / (a + b)
     return df
 
-# ─────────── Candle patterns ───────────
+# ─────────── Candle patterns (минимум) ───────────
 def bullish_engulfing(df):
-    p = df.iloc[-3]; c = df.iloc[-2]
-    return (p["close"] < p["open"]) and (c["close"] > c["open"]) and (c["close"] >= p["open"]) and (c["open"] <= p["close"])
+    try:
+        p = df.iloc[-3]; c = df.iloc[-2]
+        return (p["close"] < p["open"]) and (c["close"] > c["open"]) and (c["close"] >= p["open"]) and (c["open"] <= p["close"])
+    except Exception:
+        return False
 
 def hammer(df):
-    c = df.iloc[-2]
-    body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
-    lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
-    return (body > 0) and (rng > 0) and (lw > body*2.5) and (uw < body)
+    try:
+        c = df.iloc[-2]
+        body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
+        lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
+        return (body > 0) and (rng > 0) and (lw > body*2.5) and (uw < body)
+    except Exception:
+        return False
 
 def bearish_engulfing(df):
-    p = df.iloc[-3]; c = df.iloc[-2]
-    return (p["close"] > p["open"]) and (c["close"] < c["open"]) and (c["open"] >= p["close"]) and (c["close"] <= p["open"])
+    try:
+        p = df.iloc[-3]; c = df.iloc[-2]
+        return (p["close"] > p["open"]) and (c["close"] < c["open"]) and (c["open"] >= p["close"]) and (c["close"] <= p["open"])
+    except Exception:
+        return False
 
 def shooting_star(df):
-    c = df.iloc[-2]
-    body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
-    lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
-    return (body > 0) and (rng > 0) and (uw > body*2.5) and (lw < body)
+    try:
+        c = df.iloc[-2]
+        body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
+        lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
+        return (body > 0) and (rng > 0) and (uw > body*2.5) and (lw < body)
+    except Exception:
+        return False
 
-def bullish_pattern(df):  # для покупок
-    try: return bullish_engulfing(df) or hammer(df)
-    except Exception: return False
+def bullish_pattern(df):  # сигнал покупки
+    return bullish_engulfing(df) or hammer(df)
 
-def bearish_pattern(df):  # для продаж
-    try: return bearish_engulfing(df) or shooting_star(df)
-    except Exception: return False
+def bearish_pattern(df):  # сигнал продажи
+    return bearish_engulfing(df) or shooting_star(df)
 
-# ────────────── SIGNAL LOGIC ───────────
+# ────────────── SIGNALS (per TF) ───────────
 def tf_signals_for_symbol(symbol, timeframe):
     """
-    Возвращает список словарей сигналов для символа на конкретном ТФ.
-    tag: DEM_BUY/DEM_SELL, CANDLE_BUY/CANDLE_SELL, COMBO_BUY/COMBO_SELL
+    Возвращает список:
+      - COMBO_BUY / COMBO_SELL (жёсткие одиночные)
+      - SUMMARY (для кросс-ТФ совпадений и экстремов)
     """
     out = []
     df = fetch_ohlcv_df(symbol, timeframe)
     df = add_demarker(df)
 
-    last = df.iloc[-2]  # подтверждаем по закрытой свече
-    bar_time = last["time"]; bar_iso = bar_time.replace(tzinfo=timezone.utc).isoformat()
-    dem = float(last["demarker"]); price = float(last["close"])
+    last = df.iloc[-2]  # подтверждённая свеча
+    bar_iso = last["time"].replace(tzinfo=timezone.utc).isoformat()
+    dem = float(last["demarker"])
+    price = float(last["close"])
 
     dem_sig = "BUY" if dem <= OVERSOLD else ("SELL" if dem >= OVERBOUGHT else None)
-    bull_candle = bullish_pattern(df)   # бычьи (молот/поглощение)
-    bear_candle = bearish_pattern(df)   # медвежьи (звезда/поглощение)
+    bull = bullish_pattern(df)
+    bear = bearish_pattern(df)
 
-    # 1) чистый DeMarker
-    if dem_sig == "BUY":
-        out.append({"tag":"DEM_BUY","symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem})
-    elif dem_sig == "SELL":
-        out.append({"tag":"DEM_SELL","symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem})
-
-    # 2) чистые свечи — независимо от DeMarker, как отдельные сигналы
-    if bull_candle:
-        out.append({"tag":"CANDLE_BUY","symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem})
-    if bear_candle:
-        out.append({"tag":"CANDLE_SELL","symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem})
-
-    # 3) совместные (комбо): дем и свеча совпали по направлению
-    if dem_sig == "BUY" and bull_candle:
+    # одиночный «жёсткий» COMBO
+    if dem_sig == "BUY" and bull:
         out.append({"tag":"COMBO_BUY","symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem})
-    if dem_sig == "SELL" and bear_candle:
+    if dem_sig == "SELL" and bear:
         out.append({"tag":"COMBO_SELL","symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem})
 
+    # SUMMARY для агрегации
+    out.append({
+        "tag":"SUMMARY",
+        "symbol":symbol,"tf":timeframe,"bar_iso":bar_iso,"price":price,"dem":dem,
+        "dem_side": dem_sig, "bull": bull, "bear": bear
+    })
     return out
 
-def format_line(s):
-    ts = datetime.fromisoformat(s["bar_iso"]).strftime("%Y-%m-%d %H:%M UTC")
-    sym, tf, dem, price, tag = s["symbol"], s["tf"], s["dem"], s["price"], s["tag"]
-    if tag == "DEM_BUY":   return f"{UP} {sym} | TF {tf} | DeM ≤ {OVERSOLD:.2f} (={dem:.2f}) | Close {price:.4f} | {ts}"
-    if tag == "DEM_SELL":  return f"{DOWN} {sym} | TF {tf} | DeM ≥ {OVERBOUGHT:.2f} (={dem:.2f}) | Close {price:.4f} | {ts}"
-    if tag == "CANDLE_BUY":  return f"{CANDLE}{UP} {sym} | TF {tf} | Bullish candle | DeM {dem:.2f} | {price:.4f} | {ts}"
-    if tag == "CANDLE_SELL": return f"{CANDLE}{DOWN} {sym} | TF {tf} | Bearish candle | DeM {dem:.2f} | {price:.4f} | {ts}"
-    if tag == "COMBO_BUY":   return f"{CANDLE}{UP} {sym} | TF {tf} | COMBO: Bullish candle + DeM≤{OVERSOLD:.2f} | DeM {dem:.2f} | {price:.4f} | {ts}"
-    if tag == "COMBO_SELL":  return f"{CANDLE}{DOWN} {sym} | TF {tf} | COMBO: Bearish candle + DeM≥{OVERBOUGHT:.2f} | DeM {dem:.2f} | {price:.4f} | {ts}"
-    return f"{sym} {tf} {tag} | {ts}"
+# ────────────── Formatting ─────────────
+def fts(iso): return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M UTC")
 
+def make_line_single(symbol, tf, side, dem, price, bar_iso):
+    arrow = UP if side == "BUY" else DOWN
+    return f"{LGT}{arrow} {symbol} {tf} | {dem:.2f} | {price:.4f} | {fts(bar_iso)}"
+
+def make_line_double(symbol, side, dem4, dem1, price, bar_iso):
+    arrow = UP if side == "BUY" else DOWN
+    return f"{DLGT}{arrow} {symbol} 4h&1d | {dem4:.2f}/{dem1:.2f} | {price:.4f} | {fts(bar_iso)}"
+
+# ────────────── SCAN & SEND ───────────
 def scan_once_and_notify():
     state = load_state()
-    lines = []
+
+    per_sym = {}     # {sym: {tf: summary}}
+    single_lines = []
 
     for sym in SYMBOLS:
         for tf in TIMEFRAMES:
             try:
                 sigs = tf_signals_for_symbol(sym, tf)
                 for s in sigs:
-                    if is_new(state, s["symbol"], s["tf"], s["tag"], s["bar_iso"]):
-                        remember(state, s["symbol"], s["tf"], s["tag"], s["bar_iso"])
-                        lines.append(format_line(s))
+                    if s["tag"].startswith("COMBO"):
+                        tag = s["tag"]
+                        if is_new(state, sym, tf, tag, s["bar_iso"]):
+                            remember(state, sym, tf, tag, s["bar_iso"])
+                            side = "BUY" if "BUY" in tag else "SELL"
+                            single_lines.append(make_line_single(sym, tf, side, s["dem"], s["price"], s["bar_iso"]))
+                    elif s["tag"] == "SUMMARY":
+                        per_sym.setdefault(sym, {})[tf] = s
             except Exception as e:
                 print(f"⚠️ {sym} {tf}: {e}")
 
+    # кросс-ТФ совпадения + экстремы
+    double_lines = []
+    for sym, tfd in per_sym.items():
+        if "4h" in tfd and "1d" in tfd:
+            s4, s1 = tfd["4h"], tfd["1d"]
+            # Совпадение направления по DeMarker (BUY/SELL)
+            if s4["dem_side"] and s4["dem_side"] == s1["dem_side"]:
+                tag = f"DOUBLE_{s4['dem_side']}"
+                bar_iso = s1["bar_iso"]  # дневка как якорь
+                if is_new(state, sym, "4h&1d", tag, bar_iso):
+                    remember(state, sym, "4h&1d", tag, bar_iso)
+                    double_lines.append(
+                        make_line_double(sym, s4["dem_side"], s4["dem"], s1["dem"], s1["price"], bar_iso)
+                    )
+            # Экстремальные уровни как отдельный «жёсткий» триггер
+            if (s4["dem"] <= EXT_OVERSOLD or s4["dem"] >= EXT_OVERBOUGHT or
+                s1["dem"] <= EXT_OVERSOLD or s1["dem"] >= EXT_OVERBOUGHT):
+                side = "BUY" if (s4["dem"]<=EXT_OVERSOLD or s1["dem"]<=EXT_OVERSOLD) else "SELL"
+                tag = f"EXT_{side}"; bar_iso = s1["bar_iso"]
+                if is_new(state, sym, "EXT", tag, bar_iso):
+                    remember(state, sym, "EXT", tag, bar_iso)
+                    # одна молния (отличается от двойного совпадения)
+                    line = make_line_double(sym, side, s4["dem"], s1["dem"], s1["price"], bar_iso).replace(DLGT, LGT)
+                    double_lines.append(line)
+
+    # Итог: отправляем ТОЛЬКО «жёсткие» сигналы
+    lines = double_lines + single_lines  # двойные — первыми
     if lines:
-        header = "📊 DeMarker(28) 4h/1d — подтверждённые сигналы по закрытым свечам"
-        msg = header + "\n\n" + "\n".join(lines)
-        # делим на части, чтобы не превысить лимит Telegram
+        msg = "\n".join(lines)
         chunks = [msg[i:i+3800] for i in range(0, len(msg), 3800)]
         for c in chunks:
             bot.send_message(chat_id=CHAT_ID, text=c)
-        save_state(state)
-        print(f"✅ Sent {len(lines)} lines")
+        save_state(load_state() | {**load_state()})  # no-op write safety
+        print(f"✅ Sent {len(lines)} hard lines")
     else:
-        print("ℹ️ Новых сигналов нет")
+        print("ℹ️ Новых жёстких сигналов нет")
 
 # ───────────────── MAIN LOOP ───────────
 def main():
-    print("🚀 DeMarker bot started")
-    print(f"Symbols ({len(SYMBOLS)}): {', '.join(SYMBOLS[:15])} {'...' if len(SYMBOLS)>15 else ''}")
+    print("🚀 DeMarker bot (hard mode) started")
+    print(f"Symbols ({len(SYMBOLS)}): {', '.join(SYMBOLS[:15])}{' ...' if len(SYMBOLS)>15 else ''}")
     while True:
         print(f"⏱  Scan at {datetime.utcnow().isoformat()}Z")
         scan_once_and_notify()
