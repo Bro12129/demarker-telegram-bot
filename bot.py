@@ -1,154 +1,147 @@
-import os, time, math, requests 
-from datetime import datetime, timezone
+# bot.py
+import os
+import logging
+from datetime import timezone
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# ================== CONFIG ==================
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
-    "DOGEUSDT","TONUSDT","TRXUSDT","LINKUSDT","MATICUSDT","DOTUSDT",
-    "AVAXUSDT","SHIBUSDT","LTCUSDT","BCHUSDT","ATOMUSDT","XLMUSDT",
-    "APTUSDT","SUIUSDT","ARBUSDT","OPUSDT","NEARUSDT","INJUSDT",
-    "RUNEUSDT","AAVEUSDT","EGLDUSDT","FILUSDT","ETCUSDT","UNIUSDT"
-]  # 30 тикеров
+# === наши модули ===
+from screener import run_screen
+from state import load_state, save_state, is_new_alert, remember_alert
+from config import (TICKERS, TIMEFRAME, OVERBOUGHT, OVERSOLD,
+                    GREEN_ARROW, RED_ARROW)
 
-TIMEFRAMES = ["240", "D"]                  # 240 = 4H, D = 1D
-TF_LABEL    = {"240": "4H", "D": "1D"}
+# ====== env ======
+TOKEN = (
+    os.getenv("TG_BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+)
+CHAT_ID = (
+    os.getenv("TG_CHAT_ID")
+    or os.getenv("TELEGRAM_CHAT_ID")
+    or os.getenv("CHAT_ID")
+)
 
-DEM_LEN = 28
-OB = 0.70                                   # перекупленность -> 🔻
-OS = 0.30                                   # перепроданность -> 🔺
-SLEEP_SECONDS = 300                         # цикл раз в 5 минут
+# ====== logging ======
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("demarker-bot")
 
-CATEGORY = "spot"                           # для Bybit v5 (можешь сменить на "linear")
-BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+# ====== helpers ======
+def _fmt_line(item) -> str:
+    if item["signal"] == "BUY":
+        arrow = GREEN_ARROW
+        title = "Oversold → BUY"
+    else:
+        arrow = RED_ARROW
+        title = "Overbought → SELL"
 
-# ================== ENV ==================
-TG_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT  = os.getenv("TG_CHAT_ID", "").strip()
-ADMIN_CHAT = os.getenv("ADMIN_CHAT_ID", TG_CHAT).strip()
-HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MINUTES", "0"))
-
-assert TG_TOKEN and TG_CHAT, "Нужны TG_BOT_TOKEN и TG_CHAT_ID"
-
-# ================== HELPERS ==================
-def now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def tg_send(text: str):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15
-        )
-    except Exception as e:
-        print(f"[{now()}] TG send err: {e}", flush=True)
-
-def tg_notify(text: str):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": ADMIN_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15
-        )
-    except Exception as e:
-        print(f"[{now()}] TG notify err: {e}", flush=True)
-
-def fetch_klines(symbol: str, tf: str, limit: int = 200):
-    """Возвращает (highs, lows) от старых к новым для Bybit v5."""
-    r = requests.get(
-        BYBIT_KLINE_URL,
-        params={"category": CATEGORY, "symbol": symbol, "interval": tf, "limit": str(limit)},
-        timeout=20
+    dem = item["demarker"]
+    price = item["close"]
+    ts = item["bar_time"].strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"{arrow} {item['symbol']} | {title}\n"
+        f"TF: {TIMEFRAME} | DeM: {dem:.2f} "
+        f"(≤{OVERSOLD:.2f}/≥{OVERBOUGHT:.2f}) | Close: {price:.4f}\n"
+        f"Bar close: {ts}"
     )
-    data = r.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit {symbol} {tf}: {data.get('retCode')} {data.get('retMsg')}")
-    rows = data["result"]["list"]           # новые -> старые
-    rows.reverse()                          # старые -> новые
-    highs = [float(x[2]) for x in rows]
-    lows  = [float(x[3]) for x in rows]
-    return highs, lows
 
-def demarker(highs, lows, length: int):
-    n = len(highs)
-    deMax = [0.0]*n
-    deMin = [0.0]*n
-    for i in range(1, n):
-        dh = highs[i] - highs[i-1]
-        dl = lows[i-1] - lows[i]
-        deMax[i] = dh if dh > 0 else 0.0
-        deMin[i] = dl if dl > 0 else 0.0
+def _scan_and_notify(bot: Bot, chat_id: str):
+    """Запускает сканер, шлёт новые сигналы в чат с дедупликацией."""
+    state = load_state()
+    found = run_screen(TICKERS)
 
-    out = [math.nan]*n
-    sMax = 0.0; sMin = 0.0
-    for i in range(n):
-        sMax += deMax[i]; sMin += deMin[i]
-        if i >= length:
-            sMax -= deMax[i-length]; sMin -= deMin[i-length]
-        if i >= length:
-            denom = sMax + sMin
-            out[i] = (sMax/denom) if denom > 0 else math.nan
-    return out
+    lines = []
+    changed = False
 
-def zone(v: float) -> str:
-    if math.isnan(v): return "mid"
-    if v >= OB: return "ob"   # перекупленность -> 🔻
-    if v <= OS: return "os"   # перепроданность -> 🔺
-    return "mid"
+    for it in found:
+        if it.get("signal") is None:
+            continue
+        bar_iso = it["bar_time"].replace(tzinfo=timezone.utc).isoformat()
+        if is_new_alert(state, it["symbol"], bar_iso, it["signal"]):
+            remember_alert(state, it["symbol"], bar_iso, it["signal"])
+            lines.append(_fmt_line(it))
+            changed = True
 
-# чтобы не дублировать сигналы
-last_zone = {}  # ключ: (tf, symbol) -> "ob"/"os"/"mid"
+    if changed and lines:
+        msg = "📊 DeMarker(28) screener — подтверждённые сигналы (закрытая свеча):\n\n" + "\n\n".join(lines)
+        bot.send_message(chat_id=chat_id, text=msg)
+        save_state(state)
+        log.info("sent %d signals", len(lines))
+    else:
+        log.info("no new confirmed signals")
 
-# ================== CORE ==================
-def run_cycle():
-    for tf in TIMEFRAMES:
-        hits = []  # сообщения по данному ТФ
-        for sym in SYMBOLS:
-            try:
-                highs, lows = fetch_klines(sym, tf, limit=max(DEM_LEN+50, 120))
-                if len(highs) < DEM_LEN + 2:
-                    continue
-                dem = demarker(highs, lows, DEM_LEN)
-                # последняя ЗАКРЫТАЯ свеча — предпоследний элемент
-                v_now = dem[-2]
-                v_prev = dem[-3] if len(dem) >= 3 else math.nan
+# ====== handlers ======
+def start(update: Update, context: CallbackContext):
+    text = (
+        "✅ DeMarker bot online\n"
+        f"TF: {TIMEFRAME} | Overbought ≥ {OVERBOUGHT:.2f} | Oversold ≤ {OVERSOLD:.2f}\n"
+        "Команды:\n"
+        " /ping — проверка\n"
+        " /scan — мгновенный скан и отправка сигналов\n"
+        " /config — показать текущие настройки\n"
+    )
+    update.message.reply_text(text)
 
-                z_now = zone(v_now)
-                z_prev = zone(v_prev)
-                key = (tf, sym)
-                was = last_zone.get(key, "mid")
-                last_zone[key] = z_now
+def ping(update: Update, context: CallbackContext):
+    update.message.reply_text("pong ✅")
 
-                enter_ob = (z_prev != "ob" and z_now == "ob")  # вход в перекупленность
-                enter_os = (z_prev != "os" and z_now == "os")  # вход в перепроданность
+def show_config(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        f"TICKERS: {', '.join(TICKERS)}\n"
+        f"TIMEFRAME: {TIMEFRAME}\n"
+        f"DeMarker: 28 | OB: {OVERBOUGHT:.2f} | OS: {OVERSOLD:.2f}"
+    )
 
-                if enter_ob and was != "ob":
-                    hits.append(f"🔻 <b>{sym}</b> {v_now:.3f}")  # красная стрелка вниз — OB
-                if enter_os and was != "os":
-                    hits.append(f"🔺 <b>{sym}</b> {v_now:.3f}")  # зелёная стрелка вверх — OS
+def scan_now(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    update.message.reply_text("⏳ Запускаю скан…")
+    try:
+        _scan_and_notify(context.bot, chat_id)
+        update.message.reply_text("✅ Готово")
+    except Exception as e:
+        log.exception("scan_now failed")
+        update.message.reply_text(f"❌ Ошибка: {e}")
 
-            except Exception as e:
-                print(f"[{now()}] ERR {sym} {tf}: {e}", flush=True)
+# ====== scheduled job ======
+def job_scan(context: CallbackContext):
+    chat_id = CHAT_ID
+    if not chat_id:
+        log.warning("CHAT_ID not set, skip scheduled scan")
+        return
+    try:
+        _scan_and_notify(context.bot, chat_id)
+    except Exception:
+        log.exception("scheduled scan failed")
 
-        if hits:
-            tg_send(f"📊 DeMarker(28) — <b>{TF_LABEL[tf]}</b>\n" + "\n".join(hits))
+# ====== entrypoint ======
+def main():
+    if not TOKEN:
+        raise RuntimeError("TG_BOT_TOKEN (или TELEGRAM_BOT_TOKEN) не задан")
 
-def main_loop():
-    tg_notify("✅ Старт бота. Таймфреймы: 4H и 1D. Сигналы: 🔻 OB (≥0.70), 🔺 OS (≤0.30).")
-    last_heartbeat = time.time()
-    while True:
-        run_cycle()
-        if HEARTBEAT_MIN and (time.time() - last_heartbeat) >= HEARTBEAT_MIN * 60:
-            tg_notify("✅ Бот активен.")
-            last_heartbeat = time.time()
-        time.sleep(SLEEP_SECONDS)
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("ping", ping))
+    dp.add_handler(CommandHandler("config", show_config))
+    dp.add_handler(CommandHandler("scan", scan_now))
+
+    # Периодический скан — раз в 15 минут (можешь поменять)
+    updater.job_queue.run_repeating(job_scan, interval=900, first=10)
+
+    # Сообщение себе при старте
+    if CHAT_ID:
+        try:
+            Bot(TOKEN).send_message(chat_id=CHAT_ID, text="✅ DeMarker bot started")
+        except Exception:
+            log.exception("cannot send start message")
+
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
-    while True:
-        try:
-            main_loop()
-        except Exception as e:
-            # авто-рестарт после любой ошибки
-            tg_notify(f"❌ Критическая ошибка: {type(e).__name__}: {e}\nПерезапускаюсь через 15 сек.")
-            time.sleep(15)
-            continue
+    main()
