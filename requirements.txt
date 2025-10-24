@@ -4,4 +4,5 @@ pandas==2.0.3
 numpy==1.24.4
 ccxt==4.1.87
 ta==0.10.2
-requests 
+requests
+imghdr-py==0.4.1
