@@ -1,7 +1,9 @@
+setuptools>=65.5.0
+wheel
+python-telegram-bot==13.15
 python-dotenv==1.0.1
 pandas==2.0.3
 numpy==1.24.4
 ccxt==4.1.87
 ta==0.10.2
-python-telegram-bot==13.15
 requests
