@@ -1,289 +1,302 @@
-# DeMarker(28) screener → Telegram (hard mode: only numbers & symbols)
-# Bybit linear USDT swaps, TF: 4h & 1d. Python 3.10–3.13, без imghdr.
-import os, time, json
-from pathlib import Path
-from datetime import datetime, timezone
+import os, time, json, math, logging, datetime as dt
+from typing import List, Dict, Tuple
+import requests
 
-import pandas as pd
-import numpy as np
-import ccxt
-from dotenv import load_dotenv
-from telegram import Bot
+# ---------------------- НАСТРОЙКИ ----------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# ───────────────── ENV ─────────────────
-load_dotenv()
-BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-             or os.getenv("BOT_TOKEN"))
-CHAT_ID   = (os.getenv("TG_CHAT_ID")   or os.getenv("TELEGRAM_CHAT_ID")
-             or os.getenv("CHAT_ID"))
-if not BOT_TOKEN:
-    raise RuntimeError("TG_BOT_TOKEN/TELEGRAM_BOT_TOKEN/BOT_TOKEN не задан")
-if not CHAT_ID:
-    raise RuntimeError("TG_CHAT_ID/TELEGRAM_CHAT_ID/CHAT_ID не задан")
-bot = Bot(token=BOT_TOKEN)
+# Интервалы опроса (сек). 4H/1D пересчитываем раз в минуту — достаточно
+POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
 
-# ─────────────── CONFIG ───────────────
-TIMEFRAMES       = ["4h", "1d"]
-DEM_PERIOD       = 28
-OVERSOLD         = 0.30
-OVERBOUGHT       = 0.70
-OHLCV_LIMIT      = 300
-INTERVAL_SECONDS = 900       # каждые 15 минут
-STATE_FILE       = Path("alerts_state.json")
+# Длина DeMarker
+DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
+OB             = float(os.getenv("DEM_OB", "0.70"))
+OS             = float(os.getenv("DEM_OS", "0.30"))
 
-UP = "🟢⬆️"; DOWN = "🔴⬇️"
-LGT = "⚡"                  # молния (hard)
-# внутри строки помечаем свечной паттерн на конкретном ТФ:
-CANDLE = "🕯"
+STATE_PATH     = os.getenv("STATE_PATH", "state.json")
 
-# базовые активы для первичного подбора; далее дополним до ~45 символов
-DESIRED_BASES = [
-    "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","DOT","AVAX","MATIC","LINK","LTC",
-    "BCH","ATOM","XMR","APT","ARB","OP","NEAR","FIL","ETC","ICP","SUI","HBAR","UNI","TIA","XLM",
-    "XAU","GOLD","SPX","SP500","NAS100","NDX","DJI","SILVER","XAG"
+# Bybit v5 kline endpoint (linear деривативы)
+BYBIT_URL      = "https://api.bybit.com/v5/market/kline"
+
+# -------- ТОЛЬКО BYBIT PERP/DERIVATIVES (~30 тикеров, как просил) --------
+SYMBOLS = [
+    # Металл / Доллар / Индексы США (Bybit деривативы/индексы)
+    "BYBIT:XAUTUSDT", "BYBIT:XAUUSDT",
+    "BYBIT:DXYUSDT", "BYBIT:USDXUSDT",
+    "BYBIT:US500", "BYBIT:US100", "BYBIT:US30", "BYBIT:US2000",
+    "BYBIT:SPXUSDT", "BYBIT:NDXUSDT", "BYBIT:DJIUSDT",
+
+    # Топ монеты/альты (perp)
+    "BYBIT:BTCUSDT", "BYBIT:ETHUSDT", "BYBIT:BNBUSDT", "BYBIT:SOLUSDT",
+    "BYBIT:XRPUSDT", "BYBIT:DOGEUSDT", "BYBIT:ADAUSDT", "BYBIT:AVAXUSDT",
+    "BYBIT:MATICUSDT", "BYBIT:DOTUSDT", "BYBIT:LINKUSDT", "BYBIT:TRXUSDT",
+    "BYBIT:LTCUSDT", "BYBIT:UNIUSDT", "BYBIT:ATOMUSDT", "BYBIT:NEARUSDT",
+    "BYBIT:APTUSDT", "BYBIT:OPUSDT", "BYBIT:ARBUSDT", "BYBIT:INJUSDT",
 ]
 
-# ───────────── EXCHANGE ───────────────
-exchange = ccxt.bybit({
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"}   # перпетуалы
-})
-markets = exchange.load_markets()
+# Карта интервалов Trading (в минутах) для Bybit API
+INTERVALS = {
+    "4H": 240,
+    "1D": "D",
+}
 
-def resolve_symbols(desired_bases):
-    """Подбираем реальные USDT-линейные свопы, убираем дубли, дополняем до ~45."""
-    syms = []
-    for m in markets.values():
-        if not m.get("swap"):
+# ---------------------- ВСПОМОГАТЕЛЬНОЕ ----------------------
+def drop_prefix(sym: str) -> str:
+    # "BYBIT:BTCUSDT" -> "BTCUSDT"
+    return sym.split(":", 1)[1] if ":" in sym else sym
+
+def load_state() -> Dict:
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_state(st: Dict) -> None:
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_TOKEN or not CHAT_ID: 
+        logging.warning("TELEGRAM env not set; message skipped: %s", text); 
+        return
+    try:
+        requests.post(TG_API, json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+            "disable_notification": True
+        }, timeout=10)
+    except Exception as e:
+        logging.exception("Telegram send error: %s", e)
+
+def bybit_kline(symbol: str, interval, limit: int = 300) -> List[Dict]:
+    """
+    Возвращает список свечей (последняя — текущая формирующаяся).
+    Для сигналов используем ПРЕДЫДУЩУЮ (закрытую) свечу.
+    """
+    params = {
+        "category": "linear",              # деривативы
+        "symbol": symbol,
+        "interval": interval,              # 240 | "D"
+        "limit": str(limit),
+    }
+    r = requests.get(BYBIT_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+    # data['result']['list'] — список строк [start, open, high, low, close, volume, ...]
+    raw = data.get("result", {}).get("list", [])
+    # по доке Bybit v5 возвращает в НОВЕЙШЕМ сперва или наоборот — нормализуем по времени:
+    rows = sorted(raw, key=lambda x: int(x[0]))
+    # преобразуем в dict
+    out = []
+    for row in rows:
+        out.append({
+            "t": int(row[0]),
+            "o": float(row[1]),
+            "h": float(row[2]),
+            "l": float(row[3]),
+            "c": float(row[4]),
+            "v": float(row[5]) if len(row) > 5 else 0.0
+        })
+    return out
+
+def sma(series: List[float], length: int) -> List[float]:
+    out = []
+    s = 0.0
+    for i, x in enumerate(series):
+        s += x
+        if i >= length:
+            s -= series[i - length]
+        out.append(s / length if i >= length - 1 else float("nan"))
+    return out
+
+def demarker(hl: List[Tuple[float,float]], length: int) -> List[float]:
+    """
+    hl: список (high, low) по времени.
+    DeMarker = SMA(DEMmax, len) / (SMA(DEMmax,len) + SMA(DEMmin,len))
+    DEMmax = max(high - high[1], 0), DEMmin = max(low[1] - low, 0)
+    """
+    demax, demin = [], []
+    for i in range(len(hl)):
+        if i == 0:
+            demax.append(0.0); demin.append(0.0)
+        else:
+            up = max(hl[i][0] - hl[i-1][0], 0.0)
+            dn = max(hl[i-1][1] - hl[i][1], 0.0)
+            demax.append(up); demin.append(dn)
+    smax = sma(demax, length)
+    smin = sma(demin, length)
+    res = []
+    for i in range(len(hl)):
+        den = smax[i] + smin[i]
+        res.append(smax[i]/den if den > 0 else 0.5)
+    return res
+
+# ---------------------- СВЕЧНЫЕ ПАТТЕРНЫ ----------------------
+def candle_flags(o, h, l, c):
+    red = c < o
+    grn = c > o
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return red, grn, body, upper, lower
+
+def detect_patterns(ohlc: List[Dict]) -> Dict[str,bool]:
+    """
+    Возвращает флаги бычьих/медвежьих паттернов на ПОСЛЕДНЕЙ ЗАКРЫТОЙ СВЕЧЕ.
+    Нужны минимум 3 свечи.
+    """
+    n = len(ohlc)
+    if n < 3: 
+        return dict(bull=False, bear=False, red=False, grn=False)
+
+    # берем последнюю закрытую свечу = [-2], т.к. [-1] еще формируется
+    a = ohlc[-3]
+    b = ohlc[-2]
+    c = ohlc[-2]  # для удобства назовём b как target
+    red, grn, body, upper, lower = candle_flags(b["o"], b["h"], b["l"], b["c"])
+
+    # средняя "малость" тела: берём по 10 св.
+    last_bodies = [abs(x["c"] - x["o"]) for x in ohlc[-11:-1]]
+    avg_body10 = sum(last_bodies)/len(last_bodies) if last_bodies else 0.0
+    small_body = body <= avg_body10 * 0.6 if avg_body10 > 0 else False
+
+    # Bullish Engulfing
+    prev_red = (a["c"] < a["o"])
+    bull_engulf = grn and prev_red and (b["o"] <= a["c"]) and (b["c"] >= a["o"])
+
+    # Hammer
+    hammer = lower >= 2.0 * body and upper <= 0.25 * body
+
+    # Morning Star (упр.): красная -> малая -> зелёная; финал выше середины первой
+    morning_star = (a["c"] < a["o"]) and small_body and grn and (b["c"] >= (a["o"] + a["c"]) / 2)
+
+    # Bearish Engulfing
+    prev_grn = (a["c"] > a["o"])
+    bear_engulf = red and prev_grn and (b["o"] >= a["c"]) and (b["c"] <= a["o"])
+
+    # Shooting Star
+    shooting = upper >= 2.0 * body and lower <= 0.25 * body
+
+    # Evening Star
+    evening_star = (a["c"] > a["o"]) and small_body and red and (b["c"] <= (a["o"] + a["c"]) / 2)
+
+    bull = bull_engulf or hammer or morning_star
+    bear = bear_engulf or shooting or evening_star
+    return dict(bull=bull, bear=bear, red=red, grn=grn)
+
+# ---------------------- ЛОГИКА СИГНАЛОВ ----------------------
+def last_closed_signal(ohlc: List[Dict], dem: List[float]) -> Tuple[str, int]:
+    """
+    Возвращает ('buy'|'sell'|'' , ts_closed_bar)
+    Условия:
+      BUY: DeM<OS, свеча зелёная, бычий паттерн
+      SELL: DeM>OB, свеча красная, медвежий паттерн
+    """
+    if len(ohlc) < 3 or len(dem) < 2:
+        return "", 0
+
+    # индекс последней закрытой свечи
+    i = len(ohlc) - 2
+    o, h, l, c, t = ohlc[i]["o"], ohlc[i]["h"], ohlc[i]["l"], ohlc[i]["c"], ohlc[i]["t"]
+    flags = detect_patterns(ohlc)
+    dval = dem[i]
+
+    is_buy  = (dval < OS) and flags["grn"] and flags["bull"]
+    is_sell = (dval > OB) and flags["red"] and flags["bear"]
+
+    if is_buy:
+        return "buy", t
+    if is_sell:
+        return "sell", t
+    return "", 0
+
+def check_double_signal(sym_api: str) -> Tuple[bool, bool]:
+    """
+    Возвращает (double_buy, double_sell) — когда DeMarker одновременно в зонах
+    на 4H и 1D (используем ПОСЛЕДНИЕ ЗАКРЫТЫЕ значения).
+    """
+    # 4H
+    k4 = bybit_kline(sym_api, INTERVALS["4H"], limit=DEM_LEN+10)
+    dem4 = demarker([(x["h"], x["l"]) for x in k4], DEM_LEN)
+    i4 = len(k4) - 2 if len(k4) >= 2 else -1
+
+    # 1D
+    k1 = bybit_kline(sym_api, INTERVALS["1D"], limit=DEM_LEN+10)
+    dem1 = demarker([(x["h"], x["l"]) for x in k1], DEM_LEN)
+    i1 = len(k1) - 2 if len(k1) >= 2 else -1
+
+    if i4 < 0 or i1 < 0:
+        return (False, False)
+
+    double_buy  = (dem4[i4] < OS) and (dem1[i1] < OS)
+    double_sell = (dem4[i4] > OB) and (dem1[i1] > OB)
+    return (double_buy, double_sell)
+
+def fmt_message(ticker: str, action: str, double_flag: bool) -> str:
+    base = "🟢⬆️" if action == "buy" else "🔴⬇️"
+    return f"{base} {ticker}" + (" ⚡" if double_flag else "")
+
+# ---------------------- ОСНОВНОЙ ЦИКЛ ----------------------
+def process_symbol(sym_tv: str, state: Dict) -> None:
+    """
+    На каждый тикер:
+      - считаем сигнал на 4H и 1D (по последней закрытой свече)
+      - отправляем сообщение, если бар новый и выполнены условия
+      - если оба ТФ дают один и тот же сигнал — добавляем ⚡
+    """
+    sym_api = drop_prefix(sym_tv)
+
+    # 4H
+    k4 = bybit_kline(sym_api, INTERVALS["4H"], limit=DEM_LEN+100)
+    dem4 = demarker([(x["h"], x["l"]) for x in k4], DEM_LEN)
+    act4, ts4 = last_closed_signal(k4, dem4)
+
+    # 1D
+    k1 = bybit_kline(sym_api, INTERVALS["1D"], limit=DEM_LEN+100)
+    dem1 = demarker([(x["h"], x["l"]) for x in k1], DEM_LEN)
+    act1, ts1 = last_closed_signal(k1, dem1)
+
+    # double flag
+    dbl_buy, dbl_sell = check_double_signal(sym_api)
+
+    # отправка при новых барах (дедуп по ключу)
+    for tf, action, ts in (("4H", act4, ts4), ("1D", act1, ts1)):
+        if not action:
             continue
-        if m.get("linear") is False:
-            continue
-        base = str(m.get("base","")).upper()
-        symbol = m.get("symbol","")
-        for want in desired_bases:
-            w = want.upper()
-            if base == w or w in symbol.upper():
-                syms.append(symbol); break
-    uniq = []
-    for s in syms:
-        if s not in uniq: uniq.append(s)
-    if len(uniq) < 30:
-        extra = [m["symbol"] for m in markets.values()
-                 if m.get("swap") and m.get("linear") and "/USDT" in m["symbol"]]
-        for s in extra:
-            if s not in uniq: uniq.append(s)
-            if len(uniq) >= 45: break
-    return uniq[:45]
+        key = f"{sym_tv}|{tf}|{action}"
+        last_ts = state.get(key, 0)
+        if ts > last_ts:
+            double_flag = (dbl_buy and action=="buy") or (dbl_sell and action=="sell")
+            msg = fmt_message(sym_tv, action, double_flag)
+            send_telegram(msg)
+            state[key] = ts
 
-SYMBOLS = resolve_symbols(DESIRED_BASES)
-
-# ─────────────── STATE ────────────────
-def load_state():
-    if not STATE_FILE.exists(): return {}
-    try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception: return {}
-
-def save_state(state): STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-def _key(sym, tag): return f"{sym}:ANY:{tag}"     # минимизируем болтовню
-def is_new(state, sym, tag, bar_iso): return state.get(_key(sym, tag)) != bar_iso
-def remember(state, sym, tag, bar_iso): state[_key(sym, tag)] = bar_iso
-
-# ─────────── DATA & INDICATORS ─────────
-def fetch_ohlcv_df(symbol, timeframe):
-    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=OHLCV_LIMIT)
-    df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    return df
-
-def add_demarker(df, period=DEM_PERIOD):
-    h, l = df["high"], df["low"]
-    demax = np.where(h > h.shift(1), h - h.shift(1), 0.0)
-    demin = np.where(l < l.shift(1), l.shift(1) - l, 0.0)
-    a = pd.Series(demax, index=df.index).rolling(period).mean()
-    b = pd.Series(demin, index=df.index).rolling(period).mean()
-    df["demarker"] = a / (a + b)
-    return df
-
-# ─────────── Расширенные свечные паттерны ───────────
-def bullish_engulfing(df):
-    try:
-        p = df.iloc[-3]; c = df.iloc[-2]
-        return (p["close"] < p["open"]) and (c["close"] > c["open"]) and \
-               (c["close"] >= p["open"]) and (c["open"] <= p["close"])
-    except Exception:
-        return False
-
-def bearish_engulfing(df):
-    try:
-        p = df.iloc[-3]; c = df.iloc[-2]
-        return (p["close"] > p["open"]) and (c["close"] < c["open"]) and \
-               (c["open"] >= p["close"]) and (c["close"] <= p["open"])
-    except Exception:
-        return False
-
-def hammer(df):
-    try:
-        c = df.iloc[-2]
-        body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
-        lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
-        return (body > 0) and (rng > 0) and (lw > body*2.5) and (uw < body)
-    except Exception:
-        return False
-
-def shooting_star(df):
-    try:
-        c = df.iloc[-2]
-        body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
-        lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
-        return (body > 0) and (rng > 0) and (uw > body*2.5) and (lw < body)
-    except Exception:
-        return False
-
-def morning_star(df):
-    """Три свечи: 1 — длинная медвежья, 2 — маленькая, 3 — бычья, закрытие > середины свечи 1."""
-    try:
-        a = df.iloc[-4]; b = df.iloc[-3]; c = df.iloc[-2]
-        cond1 = a["close"] < a["open"] and (a["open"] - a["close"]) > 0.003 * a["open"]
-        cond2 = abs(b["close"] - b["open"]) < 0.004 * b["open"]
-        mid_a = (a["open"] + a["close"]) / 2.0
-        cond3 = c["close"] > c["open"] and c["close"] > mid_a
-        return cond1 and cond2 and cond3
-    except Exception:
-        return False
-
-def evening_star(df):
-    """Обратная к morning star."""
-    try:
-        a = df.iloc[-4]; b = df.iloc[-3]; c = df.iloc[-2]
-        cond1 = a["close"] > a["open"] and (a["close"] - a["open"]) > 0.003 * a["open"]
-        cond2 = abs(b["close"] - b["open"]) < 0.004 * b["open"]
-        mid_a = (a["open"] + a["close"]) / 2.0
-        cond3 = c["close"] < c["open"] and c["close"] < mid_a
-        return cond1 and cond2 and cond3
-    except Exception:
-        return False
-
-def hanging_man(df):
-    """Как hammer, но после роста (нестрогое условие тренда)."""
-    try:
-        p = df.iloc[-3]; c = df.iloc[-2]
-        body = abs(c["close"] - c["open"]); rng = c["high"] - c["low"]
-        lw = min(c["open"], c["close"]) - c["low"]; uw = c["high"] - max(c["open"], c["close"])
-        trend_up = p["close"] > p["open"]
-        return trend_up and (body > 0) and (rng > 0) and (lw > body*2.5) and (uw < body)
-    except Exception:
-        return False
-
-def bullish_pattern(df):  # покупка
-    return bullish_engulfing(df) or hammer(df) or morning_star(df)
-
-def bearish_pattern(df):  # продажа
-    return bearish_engulfing(df) or shooting_star(df) or evening_star(df) or hanging_man(df)
-
-# ────────────── HELPERS ───────────────
-def fts(iso): return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M UTC")
-
-def pack_line(sym, side, tfd):
-    """Собираем компактную строку: ⚡🟢/🔴 SYMBOL | 4h 0.26🕯 1d 0.31 | price | ts"""
-    arrow = UP if side == "BUY" else DOWN
-    parts = []
-    for tf in ["4h", "1d"]:
-        if tf in tfd:
-            dem = tfd[tf]["dem"]
-            mark = ""
-            if side == "BUY" and tfd[tf]["bull"]: mark = CANDLE
-            if side == "SELL" and tfd[tf]["bear"]: mark = CANDLE
-            parts.append(f"{tf} {dem:.2f}{mark}")
-    price_anchor = tfd["1d"]["price"] if "1d" in tfd else tfd["4h"]["price"]
-    time_anchor  = tfd["1d"]["bar_iso"] if "1d" in tfd else tfd["4h"]["bar_iso"]
-    return f"{LGT}{arrow} {sym} | " + " ".join(parts) + f" | {price_anchor:.4f} | {fts(time_anchor)}"
-
-# ────────────── SCAN & SEND ───────────
-def scan_once_and_notify():
-    state = load_state()
-
-    # собираем per-symbol/per-tf сводку
-    summary = {}   # symbol -> {tf: {"dem":..., "bull":bool, "bear":bool, "price":..., "bar_iso":...}}
-    for sym in SYMBOLS:
-        per_tf = {}
-        for tf in TIMEFRAMES:
-            try:
-                df = fetch_ohlcv_df(sym, tf)
-                df = add_demarker(df)
-                last = df.iloc[-2]   # подтверждённая свеча
-                dem = float(last["demarker"])
-                price = float(last["close"])
-                bar_iso = last["time"].replace(tzinfo=timezone.utc).isoformat()
-                per_tf[tf] = {
-                    "dem": dem,
-                    "bull": bullish_pattern(df),
-                    "bear": bearish_pattern(df),
-                    "price": price,
-                    "bar_iso": bar_iso
-                }
-            except Exception as e:
-                print(f"⚠️ {sym} {tf}: {e}")
-        if per_tf:
-            summary[sym] = per_tf
-
-    lines = []
-
-    for sym, tfd in summary.items():
-        has4 = "4h" in tfd; has1 = "1d" in tfd
-        if not (has4 or has1):
-            continue
-
-        # BUY-кандидаты (считаем флаги)
-        buy_flags = []
-        if has4 and tfd["4h"]["dem"] <= OVERSOLD: buy_flags.append(("4h","dem"))
-        if has1 and tfd["1d"]["dem"] <= OVERSOLD: buy_flags.append(("1d","dem"))
-        if has4 and tfd["4h"]["bull"]: buy_flags.append(("4h","candle"))
-        if has1 and tfd["1d"]["bull"]: buy_flags.append(("1d","candle"))
-
-        # SELL-кандидаты
-        sell_flags = []
-        if has4 and tfd["4h"]["dem"] >= OVERBOUGHT: sell_flags.append(("4h","dem"))
-        if has1 and tfd["1d"]["dem"] >= OVERBOUGHT: sell_flags.append(("1d","dem"))
-        if has4 and tfd["4h"]["bear"]: sell_flags.append(("4h","candle"))
-        if has1 and tfd["1d"]["bear"]: sell_flags.append(("1d","candle"))
-
-        # BUY: обязательно хотя бы один DeM в зоне + суммарно флагов >= 2
-        buy_zone = any(k=="dem" for _,k in buy_flags)
-        if buy_zone and len(buy_flags) >= 2:
-            tag = "BUY2"
-            bar_iso = (tfd["1d"]["bar_iso"] if has1 else tfd["4h"]["bar_iso"])
-            if is_new(state, sym, tag, bar_iso):
-                remember(state, sym, tag, bar_iso)
-                lines.append(pack_line(sym, "BUY", tfd))
-
-        # SELL: обязательно хотя бы один DeM в зоне + суммарно флагов >= 2
-        sell_zone = any(k=="dem" for _,k in sell_flags)
-        if sell_zone and len(sell_flags) >= 2:
-            tag = "SELL2"
-            bar_iso = (tfd["1d"]["bar_iso"] if has1 else tfd["4h"]["bar_iso"])
-            if is_new(state, sym, tag, bar_iso):
-                remember(state, sym, tag, bar_iso)
-                lines.append(pack_line(sym, "SELL", tfd))
-
-    if lines:
-        msg = "\n".join(lines)
-        # порежем по лимиту Telegram
-        chunks = [msg[i:i+3800] for i in range(0, len(msg), 3800)]
-        for c in chunks:
-            bot.send_message(chat_id=CHAT_ID, text=c)
-        save_state(state)
-        print(f"✅ Sent {len(lines)} hard lines (min-2 rules)")
-    else:
-        print("ℹ️ Новых сигналов (min-2) нет")
-
-# ───────────────── MAIN LOOP ───────────
 def main():
-    print("🚀 DeMarker bot (hard mode) started")
-    print(f"Symbols ({len(SYMBOLS)}): {', '.join(SYMBOLS[:15])}{' ...' if len(SYMBOLS)>15 else ''}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    state = load_state()
+    logging.info("Bot started. Tickers=%d", len(SYMBOLS))
     while True:
-        print(f"⏱  Scan at {datetime.utcnow().isoformat()}Z")
-        scan_once_and_notify()
-        time.sleep(INTERVAL_SECONDS)
+        start = time.time()
+        for sym in SYMBOLS:
+            try:
+                process_symbol(sym, state)
+            except Exception as e:
+                logging.warning("Symbol %s error: %s", sym, e)
+                continue
+        save_state(state)
+        # остаток до POLL_SECONDS
+        dt_sleep = max(0.0, POLL_SECONDS - (time.time() - start))
+        time.sleep(dt_sleep)
 
 if __name__ == "__main__":
     main()
