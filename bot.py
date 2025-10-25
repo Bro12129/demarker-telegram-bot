@@ -1,4 +1,4 @@
-import os, time, json, math, logging, datetime as dt
+import os, time, json, logging
 from typing import List, Dict, Tuple
 import requests
 
@@ -7,22 +7,23 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# Интервалы опроса (сек). 4H/1D пересчитываем раз в минуту — достаточно
+# Частота цикла (сек)
 POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
 
-# Длина DeMarker
+# DeMarker
 DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
 OB             = float(os.getenv("DEM_OB", "0.70"))
 OS             = float(os.getenv("DEM_OS", "0.30"))
 
+# Путь для локального состояния (дедуп сигналов)
 STATE_PATH     = os.getenv("STATE_PATH", "state.json")
 
-# Bybit v5 kline endpoint (linear деривативы)
+# Bybit v5 kline endpoint
 BYBIT_URL      = "https://api.bybit.com/v5/market/kline"
 
-# -------- ТОЛЬКО BYBIT PERP/DERIVATIVES (~30 тикеров, как просил) --------
+# -------- ТОЛЬКО BYBIT PERP/DERIVATIVES (~30 тикеров) --------
 SYMBOLS = [
-    # Металл / Доллар / Индексы США (Bybit деривативы/индексы)
+    # Металл / Доллар / Индексы США (Bybit деривативы/индексные контракты)
     "BYBIT:XAUTUSDT", "BYBIT:XAUUSDT",
     "BYBIT:DXYUSDT", "BYBIT:USDXUSDT",
     "BYBIT:US500", "BYBIT:US100", "BYBIT:US30", "BYBIT:US2000",
@@ -36,13 +37,10 @@ SYMBOLS = [
     "BYBIT:APTUSDT", "BYBIT:OPUSDT", "BYBIT:ARBUSDT", "BYBIT:INJUSDT",
 ]
 
-# Карта интервалов Trading (в минутах) для Bybit API
-INTERVALS = {
-    "4H": 240,
-    "1D": "D",
-}
+# интервалы Bybit API
+INTERVALS = {"4H": 240, "1D": "D"}
 
-# ---------------------- ВСПОМОГАТЕЛЬНОЕ ----------------------
+# ---------------------- УТИЛИТЫ ----------------------
 def drop_prefix(sym: str) -> str:
     # "BYBIT:BTCUSDT" -> "BTCUSDT"
     return sym.split(":", 1)[1] if ":" in sym else sym
@@ -63,8 +61,8 @@ def save_state(st: Dict) -> None:
     os.replace(tmp, STATE_PATH)
 
 def send_telegram(text: str) -> None:
-    if not TELEGRAM_TOKEN or not CHAT_ID: 
-        logging.warning("TELEGRAM env not set; message skipped: %s", text); 
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.warning("TELEGRAM_* env not set; skipped: %s", text)
         return
     try:
         requests.post(TG_API, json={
@@ -81,22 +79,14 @@ def bybit_kline(symbol: str, interval, limit: int = 300) -> List[Dict]:
     Возвращает список свечей (последняя — текущая формирующаяся).
     Для сигналов используем ПРЕДЫДУЩУЮ (закрытую) свечу.
     """
-    params = {
-        "category": "linear",              # деривативы
-        "symbol": symbol,
-        "interval": interval,              # 240 | "D"
-        "limit": str(limit),
-    }
-    r = requests.get(BYBIT_URL, params=params, timeout=15)
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
+    r = requests.get(BYBIT_URL, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
     if data.get("retCode") != 0:
         raise RuntimeError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
-    # data['result']['list'] — список строк [start, open, high, low, close, volume, ...]
     raw = data.get("result", {}).get("list", [])
-    # по доке Bybit v5 возвращает в НОВЕЙШЕМ сперва или наоборот — нормализуем по времени:
-    rows = sorted(raw, key=lambda x: int(x[0]))
-    # преобразуем в dict
+    rows = sorted(raw, key=lambda x: int(x[0]))  # по времени возр.
     out = []
     for row in rows:
         out.append({
@@ -110,8 +100,7 @@ def bybit_kline(symbol: str, interval, limit: int = 300) -> List[Dict]:
     return out
 
 def sma(series: List[float], length: int) -> List[float]:
-    out = []
-    s = 0.0
+    out, s = [], 0.0
     for i, x in enumerate(series):
         s += x
         if i >= length:
@@ -121,7 +110,6 @@ def sma(series: List[float], length: int) -> List[float]:
 
 def demarker(hl: List[Tuple[float,float]], length: int) -> List[float]:
     """
-    hl: список (high, low) по времени.
     DeMarker = SMA(DEMmax, len) / (SMA(DEMmax,len) + SMA(DEMmin,len))
     DEMmax = max(high - high[1], 0), DEMmin = max(low[1] - low, 0)
     """
@@ -133,16 +121,15 @@ def demarker(hl: List[Tuple[float,float]], length: int) -> List[float]:
             up = max(hl[i][0] - hl[i-1][0], 0.0)
             dn = max(hl[i-1][1] - hl[i][1], 0.0)
             demax.append(up); demin.append(dn)
-    smax = sma(demax, length)
-    smin = sma(demin, length)
+    smax = sma(demax, length); smin = sma(demin, length)
     res = []
     for i in range(len(hl)):
         den = smax[i] + smin[i]
         res.append(smax[i]/den if den > 0 else 0.5)
     return res
 
-# ---------------------- СВЕЧНЫЕ ПАТТЕРНЫ ----------------------
-def candle_flags(o, h, l, c):
+# ---------------------- ПАТТЕРНЫ ----------------------
+def candle_flags(o,h,l,c):
     red = c < o
     grn = c > o
     body = abs(c - o)
@@ -152,84 +139,77 @@ def candle_flags(o, h, l, c):
 
 def detect_patterns(ohlc: List[Dict]) -> Dict[str,bool]:
     """
-    Возвращает флаги бычьих/медвежьих паттернов на ПОСЛЕДНЕЙ ЗАКРЫТОЙ СВЕЧЕ.
+    Флаги бычьих/медвежьих паттернов на ПОСЛЕДНЕЙ ЗАКРЫТОЙ.
     Нужны минимум 3 свечи.
     """
     n = len(ohlc)
-    if n < 3: 
+    if n < 3:
         return dict(bull=False, bear=False, red=False, grn=False)
 
-    # берем последнюю закрытую свечу = [-2], т.к. [-1] еще формируется
-    a = ohlc[-3]
-    b = ohlc[-2]
-    c = ohlc[-2]  # для удобства назовём b как target
+    a = ohlc[-3]  # предыдущая
+    b = ohlc[-2]  # последняя закрытая
+
     red, grn, body, upper, lower = candle_flags(b["o"], b["h"], b["l"], b["c"])
 
-    # средняя "малость" тела: берём по 10 св.
     last_bodies = [abs(x["c"] - x["o"]) for x in ohlc[-11:-1]]
     avg_body10 = sum(last_bodies)/len(last_bodies) if last_bodies else 0.0
     small_body = body <= avg_body10 * 0.6 if avg_body10 > 0 else False
 
     # Bullish Engulfing
     prev_red = (a["c"] < a["o"])
-    bull_engulf = grn and prev_red and (b["o"] <= a["c"]) and (b["c"] >= a["o"])
+    bull_engulf  = grn and prev_red and (b["o"] <= a["c"]) and (b["c"] >= a["o"])
 
     # Hammer
-    hammer = lower >= 2.0 * body and upper <= 0.25 * body
+    hammer       = lower >= 2.0 * body and upper <= 0.25 * body
 
-    # Morning Star (упр.): красная -> малая -> зелёная; финал выше середины первой
-    morning_star = (a["c"] < a["o"]) and small_body and grn and (b["c"] >= (a["o"] + a["c"]) / 2)
+    # Morning Star (упрощ.)
+    morning_star = prev_red and small_body and grn and (b["c"] >= (a["o"] + a["c"]) / 2)
 
     # Bearish Engulfing
     prev_grn = (a["c"] > a["o"])
-    bear_engulf = red and prev_grn and (b["o"] >= a["c"]) and (b["c"] <= a["o"])
+    bear_engulf  = red and prev_grn and (b["o"] >= a["c"]) and (b["c"] <= a["o"])
 
     # Shooting Star
-    shooting = upper >= 2.0 * body and lower <= 0.25 * body
+    shooting     = upper >= 2.0 * body and lower <= 0.25 * body
 
     # Evening Star
-    evening_star = (a["c"] > a["o"]) and small_body and red and (b["c"] <= (a["o"] + a["c"]) / 2)
+    evening_star = prev_grn and small_body and red and (b["c"] <= (a["o"] + a["c"]) / 2)
 
     bull = bull_engulf or hammer or morning_star
     bear = bear_engulf or shooting or evening_star
     return dict(bull=bull, bear=bear, red=red, grn=grn)
 
-# ---------------------- ЛОГИКА СИГНАЛОВ ----------------------
+# ---------------------- СИГНАЛЫ ----------------------
 def last_closed_signal(ohlc: List[Dict], dem: List[float]) -> Tuple[str, int]:
     """
-    Возвращает ('buy'|'sell'|'' , ts_closed_bar)
-    Условия:
-      BUY: DeM<OS, свеча зелёная, бычий паттерн
-      SELL: DeM>OB, свеча красная, медвежий паттерн
+    ('buy'|'sell'|'' , ts_closed_bar)
+      BUY:  DeM<OS  & зелёная свеча & бычий паттерн
+      SELL: DeM>OB  & красная свеча & медвежий паттерн
     """
     if len(ohlc) < 3 or len(dem) < 2:
         return "", 0
 
-    # индекс последней закрытой свечи
-    i = len(ohlc) - 2
-    o, h, l, c, t = ohlc[i]["o"], ohlc[i]["h"], ohlc[i]["l"], ohlc[i]["c"], ohlc[i]["t"]
+    i = len(ohlc) - 2  # индекс последней закрытой
+    o,h,l,c,t = ohlc[i]["o"], ohlc[i]["h"], ohlc[i]["l"], ohlc[i]["c"], ohlc[i]["t"]
     flags = detect_patterns(ohlc)
     dval = dem[i]
 
     is_buy  = (dval < OS) and flags["grn"] and flags["bull"]
     is_sell = (dval > OB) and flags["red"] and flags["bear"]
 
-    if is_buy:
-        return "buy", t
-    if is_sell:
-        return "sell", t
+    if is_buy:  return "buy", t
+    if is_sell: return "sell", t
     return "", 0
 
 def check_double_signal(sym_api: str) -> Tuple[bool, bool]:
     """
-    Возвращает (double_buy, double_sell) — когда DeMarker одновременно в зонах
-    на 4H и 1D (используем ПОСЛЕДНИЕ ЗАКРЫТЫЕ значения).
+    Возвращает (double_buy, double_sell) — DeMarker одновременно в зонах
+    на 4H и 1D (по последней закрытой).
     """
     # 4H
     k4 = bybit_kline(sym_api, INTERVALS["4H"], limit=DEM_LEN+10)
     dem4 = demarker([(x["h"], x["l"]) for x in k4], DEM_LEN)
     i4 = len(k4) - 2 if len(k4) >= 2 else -1
-
     # 1D
     k1 = bybit_kline(sym_api, INTERVALS["1D"], limit=DEM_LEN+10)
     dem1 = demarker([(x["h"], x["l"]) for x in k1], DEM_LEN)
@@ -246,12 +226,11 @@ def fmt_message(ticker: str, action: str, double_flag: bool) -> str:
     base = "🟢⬆️" if action == "buy" else "🔴⬇️"
     return f"{base} {ticker}" + (" ⚡" if double_flag else "")
 
-# ---------------------- ОСНОВНОЙ ЦИКЛ ----------------------
 def process_symbol(sym_tv: str, state: Dict) -> None:
     """
     На каждый тикер:
-      - считаем сигнал на 4H и 1D (по последней закрытой свече)
-      - отправляем сообщение, если бар новый и выполнены условия
+      - считаем сигнал на 4H и 1D (по последней закрытой)
+      - отправляем сообщение, если новый бар и выполнены условия
       - если оба ТФ дают один и тот же сигнал — добавляем ⚡
     """
     sym_api = drop_prefix(sym_tv)
@@ -266,10 +245,8 @@ def process_symbol(sym_tv: str, state: Dict) -> None:
     dem1 = demarker([(x["h"], x["l"]) for x in k1], DEM_LEN)
     act1, ts1 = last_closed_signal(k1, dem1)
 
-    # double flag
     dbl_buy, dbl_sell = check_double_signal(sym_api)
 
-    # отправка при новых барах (дедуп по ключу)
     for tf, action, ts in (("4H", act4, ts4), ("1D", act1, ts1)):
         if not action:
             continue
@@ -281,6 +258,7 @@ def process_symbol(sym_tv: str, state: Dict) -> None:
             send_telegram(msg)
             state[key] = ts
 
+# ---------------------- MAIN ----------------------
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     state = load_state()
@@ -294,9 +272,8 @@ def main():
                 logging.warning("Symbol %s error: %s", sym, e)
                 continue
         save_state(state)
-        # остаток до POLL_SECONDS
-        dt_sleep = max(0.0, POLL_SECONDS - (time.time() - start))
-        time.sleep(dt_sleep)
+        sleep_left = max(0.0, POLL_SECONDS - (time.time() - start))
+        time.sleep(sleep_left)
 
 if __name__ == "__main__":
     main()
