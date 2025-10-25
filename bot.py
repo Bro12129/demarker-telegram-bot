@@ -3,7 +3,7 @@ from typing import List, Dict, Tuple
 import requests
 
 # ---------------------- НАСТРОЙКИ ----------------------
-# Telegram
+# Telegram (читаем из TELEGRAM_TOKEN ИЛИ TELEGRAM_BOT_TOKEN)
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -11,16 +11,24 @@ TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 # Частота цикла (сек)
 POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
 
-# DeMarker
+# DeMarker (перекуп/перепрод)
 DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
-OB             = float(os.getenv("DEM_OB", "0.70"))
-OS             = float(os.getenv("DEM_OS", "0.30"))
+OB             = float(os.getenv("DEM_OB", "0.70"))  # overbought
+OS             = float(os.getenv("DEM_OS", "0.30"))  # oversold
 
 # Путь для локального состояния (дедуп сигналов)
 STATE_PATH     = os.getenv("STATE_PATH", "state.json")
 
-# Bybit v5 kline endpoint — ЖЁСТКО зафиксирован, чтобы исключить ошибки URL/ENV
-BYBIT_URL      = "https://api.bybit.com/v5/market/kline"
+# Bybit v5 kline endpoint
+# По умолчанию основной хост; можно переопределить BYBIT_URL в ENV (оставил защиту от кривых "https:/")
+def _safe_bybit_url() -> str:
+    raw = (os.getenv("BYBIT_URL") or "https://api.bybit.com/v5/market/kline").strip()
+    raw = raw.replace("https:/", "https://").replace("http:/", "http://")
+    if not (raw.startswith("https://") or raw.startswith("http://")):
+        raw = "https://api.bybit.com/v5/market/kline"
+    return raw
+
+BYBIT_URL = _safe_bybit_url()
 
 # -------- ТОЛЬКО BYBIT PERP/DERIVATIVES (~30 тикеров) --------
 SYMBOLS = [
@@ -38,7 +46,7 @@ SYMBOLS = [
     "BYBIT:APTUSDT", "BYBIT:OPUSDT", "BYBIT:ARBUSDT", "BYBIT:INJUSDT",
 ]
 
-# интервалы Bybit API (ТОЛЬКО 4H и 1D — как ты просил)
+# интервалы Bybit API (РОВНО 4H и 1D)
 INTERVALS = {"4H": 240, "1D": "D"}
 
 # ---------------------- УТИЛИТЫ ----------------------
@@ -75,16 +83,16 @@ def send_telegram(text: str) -> None:
     except Exception as e:
         logging.exception("Telegram send error: %s", e)
 
+# ---------------------- API BYBIT ----------------------
+HEADERS = {"User-Agent": "demarker-bot/1.0", "Accept": "application/json"}
+
 def bybit_kline(symbol: str, interval, limit: int = 300) -> List[Dict]:
     """
     Возвращает список свечей (последняя — текущая формирующаяся).
     Для сигналов используем ПРЕДЫДУЩУЮ (закрытую) свечу.
     """
     params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
-    r = requests.get(BYBIT_URL, params=params, timeout=20, headers={
-        "User-Agent": "demarker-bot/1.0",
-        "Accept": "application/json",
-    })
+    r = requests.get(BYBIT_URL, params=params, timeout=20, headers=HEADERS)
     r.raise_for_status()
     data = r.json()
     if data.get("retCode") != 0:
@@ -103,6 +111,7 @@ def bybit_kline(symbol: str, interval, limit: int = 300) -> List[Dict]:
         })
     return out
 
+# ---------------------- ИНДИКАТОРЫ ----------------------
 def sma(series: List[float], length: int) -> List[float]:
     out, s = [], 0.0
     for i, x in enumerate(series):
@@ -224,16 +233,16 @@ def check_double_signal(sym_api: str) -> Tuple[bool, bool]:
     return (double_buy, double_sell)
 
 def fmt_message(ticker: str, action: str, double_flag: bool) -> str:
-    # Без эмодзи, только текст
-    base = "BUY" if action == "buy" else "SELL"
-    return f"{base} {ticker}" + (" [DOUBLE]" if double_flag else "")
+    # Эмодзи как просил: зелёная/красная + стрелка, и ⚡ при двойном совпадении
+    base = "🟢⬆️" if action == "buy" else "🔴⬇️"
+    return f"{base} {ticker}" + (" ⚡" if double_flag else "")
 
 def process_symbol(sym_tv: str, state: Dict) -> None:
     """
     На каждый тикер:
       - считаем сигнал на 4H и 1D (по последней закрытой)
       - отправляем сообщение, если новый бар и выполнены условия
-      - если оба ТФ дают один и тот же сигнал — добавляем [DOUBLE]
+      - если оба ТФ дают один и тот же сигнал — добавляем ⚡
     """
     sym_api = drop_prefix(sym_tv)
 
