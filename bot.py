@@ -19,7 +19,7 @@ OS             = float(os.getenv("DEM_OS", "0.30"))
 STATE_PATH     = os.getenv("STATE_PATH", "state.json")
 
 # Bybit v5 kline endpoint
-BYBIT_URL      = "https://api.bybit.com/v5/market/kline"
+BYBIT_URL = os.getenv("BYBIT_URL", "https://api.bybit.com/v5/market/kline")
 
 # -------- ТОЛЬКО BYBIT PERP/DERIVATIVES (~30 тикеров) --------
 SYMBOLS = [
