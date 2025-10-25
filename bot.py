@@ -3,7 +3,8 @@ from typing import List, Dict, Tuple
 import requests
 
 # ---------------------- НАСТРОЙКИ ----------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+# токен читаем из TELEGRAM_TOKEN или TELEGRAM_BOT_TOKEN
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
 CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
@@ -18,8 +19,17 @@ OS             = float(os.getenv("DEM_OS", "0.30"))
 # Путь для локального состояния (дедуп сигналов)
 STATE_PATH     = os.getenv("STATE_PATH", "state.json")
 
-# Bybit v5 kline endpoint
-BYBIT_URL = os.getenv("BYBIT_URL", "https://api.bybit.com/v5/market/kline")
+# Bybit v5 kline endpoint (с защитой от кривых значений и дефолтом на зеркало)
+def _safe_bybit_url() -> str:
+    raw = (os.getenv("BYBIT_URL") or "").strip()
+    if not raw:
+        raw = "https://api.bytick.com/v5/market/kline"  # зеркало по умолчанию
+    raw = raw.replace("https:/", "https://").replace("http:/", "http://")
+    if not (raw.startswith("https://") or raw.startswith("http://")):
+        raw = "https://api.bytick.com/v5/market/kline"
+    return raw
+
+BYBIT_URL = _safe_bybit_url()
 
 # -------- ТОЛЬКО BYBIT PERP/DERIVATIVES (~30 тикеров) --------
 SYMBOLS = [
