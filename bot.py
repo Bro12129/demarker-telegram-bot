@@ -1,307 +1,297 @@
 # bot.py
-# -*- coding: utf-8 -*-
-import os, time, json, math, logging, requests
-from typing import List, Dict, Tuple
+import os
+import json
+import time
+import math
+import logging
+from typing import Dict, List, Tuple, Any
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+import requests
 
-# ===================== ENV =====================
+# ---------------------- LOGGING ----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+# ---------------------- ENV ----------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
 CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-BYBIT_URL      = os.getenv("BYBIT_URL", "https://api.bybit.com")
-CATEGORY       = os.getenv("BYBIT_CATEGORY", "linear")  # linear | inverse | option | spot
-SYMBOLS        = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
-TF_MIN         = int(os.getenv("TF", "240"))  # 240=H4, 60=H1, 1440=D1
-LIMIT          = int(os.getenv("LIMIT", "300"))
+POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
 
 # DeMarker
 DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
-OB             = float(os.getenv("DEM_OB", "0.70"))  # перекупленность
-OS             = float(os.getenv("DEM_OS", "0.30"))  # перепроданность
-EPS            = float(os.getenv("EPS", "1e-4"))
+OB             = float(os.getenv("DEM_OB", "0.70"))
+OS             = float(os.getenv("DEM_OS", "0.30"))
 
-# Подтверждение таймфреймов: none | H4_D1
-CONF_REQ       = os.getenv("CONF_REQ", "none").lower()
+# Состояние (для дедупа сигналов между рестартами)
+STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 
-# Фитили (“стрелы”)
-WICK_BODY_RATIO   = float(os.getenv("WICK_BODY_RATIO", "1.8"))    # фитиль >= X * тело
-WICK_RANGE_RATIO  = float(os.getenv("WICK_RANGE_RATIO", "0.40"))   # фитиль >= Y * (high-low)
-CHECK_LAST_BARS   = int(os.getenv("CHECK_LAST_BARS", "2"))         # проверяем N последних ЗАКРЫТЫХ свечей (обычно 2)
+# Тикеры и интервалы
+# По умолчанию USDT-перпетуалы, как и раньше
+TICKERS_ENV    = os.getenv("TICKERS", "BTCUSDT,ETHUSDT")
+TICKERS: List[str] = [t.strip().upper() for t in TICKERS_ENV.split(",") if t.strip()]
 
-# Пауза между циклами
-POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
+# 4h и 1d — в минутах для Bybit v5
+INTERVALS_MIN  = [240, 1440]
 
-# Состояние для дедупа
-STATE_PATH     = os.getenv("STATE_PATH", "./state.json")
+# Bybit v5 — база и путь разделены (фикс 404 при двойном /v5/...)
+BYBIT_BASE_URL = os.getenv("BYBIT_URL", "https://api.bybit.com").rstrip("/")
+BYBIT_KLINE_URL = f"{BYBIT_BASE_URL}/v5/market/kline"   # <- правильный путь
+BYBIT_CATEGORY  = os.getenv("BYBIT_CATEGORY", "linear")  # linear|inverse|spot
 
-# ===================== UTILS =====================
-def load_state() -> Dict[str, str]:
+# ---------------------- NET UTILS ----------------------
+def http_get_json(url: str, params: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
+    """Обёртка над requests.get с понятными ошибками и ретраями."""
+    tries = 3
+    last_err = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            logging.error("HTTP GET failed (%s/%s) %s %s", i + 1, tries, url, params)
+            time.sleep(1 + i)
+    raise RuntimeError(f"GET {url} failed after {tries} tries: {last_err}")
+
+# ---------------------- BYBIT ----------------------
+def fetch_klines(symbol: str, interval_minutes: int = 240, limit: int = 300) -> List[Dict[str, Any]]:
+    """
+    Возвращает список свечей (последняя — текущая, предпоследняя — закрытая).
+    Bybit v5: /v5/market/kline
+    """
+    params = {
+        "category": BYBIT_CATEGORY,            # linear по умолчанию как вчера
+        "symbol": symbol,
+        "interval": str(interval_minutes),     # "240" или "1440"
+        "limit": str(limit),
+    }
+    data = http_get_json(BYBIT_KLINE_URL, params)
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error: {data}")
+    rows = data.get("result", {}).get("list", [])
+    # Bybit возвращает строки в порядке от новой к старой
+    # Преобразуем в удобный формат и реверснем (старые -> новые)
+    klines = []
+    for row in rows:
+        # формат: [startTime, open, high, low, close, volume, turnover]
+        ts = int(row[0]) // 1000
+        o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+        klines.append({"t": ts, "o": o, "h": h, "l": l, "c": c})
+    klines.reverse()
+    return klines
+
+# ---------------------- INDICATORS ----------------------
+def demarker(high: List[float], low: List[float], length: int) -> List[float]:
+    """
+    DeMarker:
+      DeMax_t = max(high_t - high_{t-1}, 0)
+      DeMin_t = max(low_{t-1} - low_t, 0)
+      DeM = SMA(DeMax, len) / (SMA(DeMax, len) + SMA(DeMin, len))
+    Возвращает список значений той же длины (первые length значений — NaN).
+    """
+    n = len(high)
+    if n != len(low) or n == 0:
+        return []
+    demax = [0.0] * n
+    demin = [0.0] * n
+    for i in range(1, n):
+        demax[i] = max(high[i] - high[i - 1], 0.0)
+        demin[i] = max(low[i - 1] - low[i], 0.0)
+
+    def sma(arr: List[float], m: int) -> List[float]:
+        out = [math.nan] * n
+        s = 0.0
+        for i in range(n):
+            s += arr[i]
+            if i >= m:
+                s -= arr[i - m]
+            if i >= m - 1:
+                out[i] = s / m
+        return out
+
+    demx = sma(demax, length)
+    demn = sma(demin, length)
+    out = [math.nan] * n
+    for i in range(n):
+        a = demx[i]; b = demn[i]
+        if math.isnan(a) or math.isnan(b) or (a + b) == 0:
+            out[i] = math.nan
+        else:
+            out[i] = a / (a + b)
+    return out
+
+def detect_pinbar(c: Dict[str, float]) -> str:
+    """
+    Простейший пин-бар:
+      - длинная тень в 2.5x тела и ≥ 60% всей свечи
+      - бычий pin => длинная нижняя тень
+      - медвежий pin => длинная верхняя тень
+    Возвращает "bull_pin" / "bear_pin" / "".
+    """
+    o, h, l, cl = c["o"], c["h"], c["l"], c["c"]
+    body = abs(cl - o)
+    range_ = max(h - l, 1e-12)
+    upper = h - max(o, cl)
+    lower = min(o, cl) - l
+
+    if body < range_ * 0.4:  # тело не доминирует
+        if lower >= max(upper, body * 2.5) and lower >= range_ * 0.6:
+            return "bull_pin"
+        if upper >= max(lower, body * 2.5) and upper >= range_ * 0.6:
+            return "bear_pin"
+    return ""
+
+# ---------------------- STATE ----------------------
+def load_state(path: str) -> Dict[str, Any]:
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r") as f:
             return json.load(f)
     except Exception:
         return {}
 
-def save_state(state: Dict[str, str]) -> None:
+def save_state(path: str, state: Dict[str, Any]) -> None:
     try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(state, f)
     except Exception as e:
-        logging.error(f"Failed to save state: {e}")
+        logging.error("Failed to save state: %s", e)
 
-def send_telegram(text: str) -> None:
+# ---------------------- TELEGRAM ----------------------
+def tg_send(text: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning("Telegram creds missing; message not sent.")
+        logging.warning("TELEGRAM credentials are empty; skip send")
         return
     try:
-        r = requests.post(TG_API, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-        if r.status_code != 200:
-            logging.error(f"Telegram error {r.status_code}: {r.text}")
+        resp = requests.post(TG_API, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+        resp.raise_for_status()
     except Exception as e:
-        logging.error(f"Telegram send error: {e}")
+        logging.error("Telegram send failed: %s", e)
 
-def interval_from_minutes(tf_min: int) -> str:
-    # Bybit v5 intervals: 1,3,5,15,30,60,120,240,360,720,D,W,M
-    m = tf_min
-    if m in (1,3,5,15,30,60,120,240,360,720):
-        return str(m)
-    if m == 1440: return "D"
-    if m == 10080: return "W"
-    if m == 43200: return "M"
-    return str(m)
-
-# ===================== BYBIT =====================
-def fetch_klines(symbol: str, tf_min: int, limit: int) -> List[Dict]:
+# ---------------------- SIGNALS ----------------------
+def analyze_symbol(symbol: str) -> List[Tuple[str, str]]:
     """
-    Возвращает список свечей ASC (старые -> новые)
-    Поля: start (ms), open, high, low, close (floats), volume (float)
+    Возвращает список сигналов в формате [(dedup_key, message), ...]
+    Генерируем:
+      1) Сигналы по каждому ТФ отдельно (4h, 1d)
+      2) Комбинированный сигнал (если оба ТФ в одинаковой зоне OB/OS)
+      3) Усиление сигналом пин-бара (если есть на соответствующем ТФ)
     """
-    interval = interval_from_minutes(tf_min)
-    url = f"{BYBIT_URL}/v5/market/kline"
-    params = {
-        "category": CATEGORY,
-        "symbol": symbol,
-        "interval": interval,
-        "limit": str(limit)
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit retCode={data.get('retCode')} {data.get('retMsg')}")
-    lst = data["result"]["list"]  # частo newest->oldest
-    bars = []
-    for row in lst:
-        # row = [start, open, high, low, close, volume, turnover]
-        start = int(row[0])
-        o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
-        v = float(row[5]) if len(row) > 5 and row[5] is not None else 0.0
-        bars.append({"start": start, "open": o, "high": h, "low": l, "close": c, "volume": v})
-    bars.sort(key=lambda x: x["start"])  # в ASC
-    return bars
+    signals: List[Tuple[str, str]] = []
 
-def only_closed(bars: List[Dict], tf_min: int) -> List[Dict]:
-    """Отбрасывает текущую строящуюся свечу (если она ещё не закрылась)."""
-    if not bars:
-        return bars
-    now_ms = int(time.time() * 1000)
-    tf_ms  = tf_min * 60_000
-    last = bars[-1]
-    if now_ms < last["start"] + tf_ms:
-        return bars[:-1]
-    return bars
+    data_by_tf: Dict[int, List[Dict[str, Any]]] = {}
+    dem_by_tf: Dict[int, List[float]] = {}
 
-# ===================== INDICATORS =====================
-def sma(values: List[float], length: int) -> List[float]:
-    out = [math.nan]*len(values)
-    if length <= 0 or len(values) < length:
-        return out
-    s = 0.0
-    for i, v in enumerate(values):
-        s += v
-        if i >= length:
-            s -= values[i-length]
-        if i >= length-1:
-            out[i] = s/length
-    return out
-
-def demarker_from_hl(highs: List[float], lows: List[float], length: int) -> List[float]:
-    """
-    DeMarker:
-      Up[i]   = max( high[i] - high[i-1], 0 )
-      Down[i] = max( low[i-1] - low[i], 0 )
-      DeM[i]  = SMA(Up, n) / (SMA(Up, n) + SMA(Down, n))
-    """
-    n = len(highs)
-    up = [0.0]*n
-    dn = [0.0]*n
-    for i in range(1, n):
-        uh = highs[i] - highs[i-1]
-        up[i] = uh if uh > 0 else 0.0
-        dl = lows[i-1] - lows[i]
-        dn[i] = dl if dl > 0 else 0.0
-    up_sma = sma(up, length)
-    dn_sma = sma(dn, length)
-    dem = [math.nan]*n
-    for i in range(n):
-        u = up_sma[i]
-        d = dn_sma[i]
-        if not math.isnan(u) and not math.isnan(d) and (u + d) > 0:
-            dem[i] = u / (u + d)
-    return dem
-
-# ===================== PATTERNS (WICKS) =====================
-def wick_stats(o: float, h: float, l: float, c: float) -> Tuple[float,float,float,float]:
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    rng   = max(h - l, 1e-9)
-    return body, upper, lower, rng
-
-def is_arrow_down(o,h,l,c) -> bool:
-    # длинный верхний фитиль — стрелка вниз (SELL)
-    body, upper, lower, rng = wick_stats(o,h,l,c)
-    return (upper >= WICK_BODY_RATIO * body) and (upper >= WICK_RANGE_RATIO * rng)
-
-def is_arrow_up(o,h,l,c) -> bool:
-    # длинный нижний фитиль — стрелка вверх (BUY)
-    body, upper, lower, rng = wick_stats(o,h,l,c)
-    return (lower >= WICK_BODY_RATIO * body) and (lower >= WICK_RANGE_RATIO * rng)
-
-# ===================== SIGNAL LOGIC =====================
-def dem_zone(v: float) -> str:
-    if v >= OB - EPS: return "OB"  # overbought
-    if v <= OS + EPS: return "OS"  # oversold
-    return "MID"
-
-def align_tf_condition(h4_zone: str, d1_zone: str) -> bool:
-    # Совпадение зон для подтверждения H4_D1
-    if h4_zone == "OB" and d1_zone == "OB": return True
-    if h4_zone == "OS" and d1_zone == "OS": return True
-    return False
-
-def build_signal_text(symbol: str, tf_min: int, direction: str, reason: str,
-                      price: float, dem_val: float, bar_time_ms: int) -> str:
-    tf_label = f"{tf_min}m" if tf_min < 1440 else ("1D" if tf_min==1440 else f"{tf_min}m")
-    ts = time.strftime("%Y-%m-%d %H:%M", time.gmtime(bar_time_ms/1000))
-    return (
-        f"<b>{symbol}</b> | <b>{direction}</b> | TF <b>{tf_label}</b>\n"
-        f"Price: <code>{price:.2f}</code>\n"
-        f"DeMarker: <code>{dem_val:.4f}</code>\n"
-        f"Reason: {reason}\n"
-        f"Bar close (UTC): <code>{ts}</code>"
-    )
-
-def evaluate_symbol(symbol: str, state: Dict[str,str]) -> None:
-    # ---- основная ТФ ----
-    bars = fetch_klines(symbol, TF_MIN, LIMIT)
-    bars = only_closed(bars, TF_MIN)
-    if len(bars) < max(DEM_LEN+2, 10):
-        logging.info(f"{symbol}: not enough bars")
-        return
-
-    highs = [b["high"] for b in bars]
-    lows  = [b["low"]  for b in bars]
-    closes= [b["close"]for b in bars]
-    dem   = demarker_from_hl(highs, lows, DEM_LEN)
-
-    # Для H4/D1 подтверждения — берём D1 зону, если требуется
-    d1_zone = None
-    if CONF_REQ == "h4_d1":
-        d1_bars = fetch_klines(symbol, 1440, max(DEM_LEN+2, 120))
-        d1_bars = only_closed(d1_bars, 1440)
-        if len(d1_bars) >= DEM_LEN+2:
-            d1_highs = [b["high"] for b in d1_bars]
-            d1_lows  = [b["low"]  for b in d1_bars]
-            d1_dem   = demarker_from_hl(d1_highs, d1_lows, DEM_LEN)
-            d1_zone  = dem_zone(d1_dem[-1])
-
-    # --- проверяем последние закрытые свечи: последняя и предпоследняя ---
-    n = len(bars)
-    look = min(max(CHECK_LAST_BARS, 1), 5)
-    idxs = list(range(n - look, n))  # индексы последних закрытых свечей
-
-    for i in idxs:
-        b  = bars[i]
-        o,h,l,c = b["open"], b["high"], b["low"], b["close"]
-        d  = dem[i]
-        if math.isnan(d):
-            continue
-
-        zone = dem_zone(d)
-        if CONF_REQ == "h4_d1" and d1_zone is not None:
-            if not align_tf_condition(zone, d1_zone):
-                # если требуется H4_D1 и они не совпали — пропускаем
+    # Загружаем свечи и ДеМаркер
+    for tf in INTERVALS_MIN:
+        try:
+            kl = fetch_klines(symbol, tf, limit=max(DEM_LEN + 50, 300))
+            if len(kl) < DEM_LEN + 2:
                 continue
+            data_by_tf[tf] = kl
+            dem_by_tf[tf] = demarker([x["h"] for x in kl], [x["l"] for x in kl], DEM_LEN)
+        except Exception as e:
+            logging.error("%s %s fetch/analyze failed: %s", symbol, tf, e)
 
-        # --- стрелы-фитили ---
-        sell_by_wick = (zone == "OB") and is_arrow_down(o,h,l,c)
-        buy_by_wick  = (zone == "OS") and is_arrow_up(o,h,l,c)
+    if not data_by_tf:
+        return signals
 
-        # --- чистые кроссы DeMarker (оставлено для совместимости, ничего не удалял) ---
-        cross_sell = False
-        cross_buy  = False
-        if i >= 2 and not math.isnan(dem[i-1]):
-            prev = dem[i-1]
-            cross_sell = (prev < OB - EPS) and (d >= OB - EPS)
-            cross_buy  = (prev > OS + EPS) and (d <= OS + EPS)
+    def fmt_tf(tf_m: int) -> str:
+        return "4H" if tf_m == 240 else "1D" if tf_m == 1440 else f"{tf_m}m"
 
-        # приоритет: фитильные сигналы, затем кроссы
-        signal = None
-        reason = None
-        direction = None
-        if sell_by_wick:
-            signal = True
-            direction = "SELL"
-            reason = f"WICK-ARROW ↑ (upper) & DeM≥{OB}"
-        elif buy_by_wick:
-            signal = True
-            direction = "BUY"
-            reason = f"WICK-ARROW ↓ (lower) & DeM≤{OS}"
-        elif cross_sell:
-            signal = True
-            direction = "SELL"
-            reason = f"DeMarker CROSS into OB (≥{OB})"
-        elif cross_buy:
-            signal = True
-            direction = "BUY"
-            reason = f"DeMarker CROSS into OS (≤{OS})"
+    # Последняя ЗАКРЫТАЯ свеча = индекс -2
+    status: Dict[int, Dict[str, Any]] = {}
+    for tf, kl in data_by_tf.items():
+        dems = dem_by_tf[tf]
+        if not dems or math.isnan(dems[-2]):
+            continue
+        last = kl[-2]
+        pb = detect_pinbar(last)
+        zone = "OB" if dems[-2] >= OB else "OS" if dems[-2] <= OS else "NEUTRAL"
+        status[tf] = {"ts": last["t"], "dem": dems[-2], "zone": zone, "pin": pb, "bar": last}
 
-        if not signal:
+    # Индивидуальные сигналы
+    for tf, st in status.items():
+        if st["zone"] == "OB":
+            sig = "SELL"
+        elif st["zone"] == "OS":
+            sig = "BUY"
+        else:
             continue
 
-        # дедуп по символу+TF+времени свечи+направлению
-        sig_id = f"{symbol}|{TF_MIN}|{b['start']}|{direction}"
-        if state.get("last_id") == sig_id:
-            continue
+        extras = []
+        if st["pin"] == "bear_pin" and sig == "SELL":
+            extras.append("bear pin")
+        if st["pin"] == "bull_pin" and sig == "BUY":
+            extras.append("bull pin")
 
-        text = build_signal_text(
-            symbol=symbol, tf_min=TF_MIN, direction=direction, reason=reason,
-            price=c, dem_val=d, bar_time_ms=b["start"]
+        msg = (
+            f"🔔 {symbol} {sig} — {fmt_tf(tf)}\n"
+            f"DeM({DEM_LEN})={st['dem']:.3f} [{st['zone']}], "
+            f"OB={OB:.2f} / OS={OS:.2f}"
+            + (f"\nCandle: {', '.join(extras)}" if extras else "")
         )
-        send_telegram(text)
-        state["last_id"] = sig_id
-        save_state(state)
+        key = f"{symbol}:{tf}:{st['ts']}:{sig}"
+        signals.append((key, msg))
 
-# ===================== MAIN LOOP =====================
-def main_loop():
-    state = load_state()
+    # Комбинированный сигнал (оба ТФ совпали)
+    if 240 in status and 1440 in status:
+        zone4 = status[240]["zone"]
+        zone1d = status[1440]["zone"]
+        if zone4 in ("OB", "OS") and zone4 == zone1d:
+            sig = "SELL" if zone4 == "OB" else "BUY"
+            msg = (
+                f"⚡ {symbol} {sig} — 4H & 1D согласованы\n"
+                f"4H DeM={status[240]['dem']:.3f} [{zone4}] | "
+                f"1D DeM={status[1440]['dem']:.3f} [{zone1d}]\n"
+                f"OB={OB:.2f} / OS={OS:.2f}"
+            )
+            key = f"{symbol}:combo:{status[240]['ts']}:{status[1440]['ts']}:{sig}"
+            signals.append((key, msg))
+
+    return signals
+
+# ---------------------- MAIN LOOP ----------------------
+def main() -> None:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not set")
+
+    state = load_state(STATE_PATH)
+    if "sent" not in state:
+        state["sent"] = {}
+    sent = state["sent"]
+
+    logging.info("Worker started | TICKERS=%s | CAT=%s | URL=%s", TICKERS, BYBIT_CATEGORY, BYBIT_KLINE_URL)
+
     while True:
         try:
-            for sym in SYMBOLS:
+            for sym in TICKERS:
                 try:
-                    evaluate_symbol(sym, state)
+                    sigs = analyze_symbol(sym)
+                    for key, msg in sigs:
+                        if key in sent:
+                            continue
+                        tg_send(msg)
+                        sent[key] = int(time.time())
+                        # ограничиваем размер памяти дедупа
+                        if len(sent) > 5000:
+                            # удалим самые старые
+                            to_del = sorted(sent.items(), key=lambda x: x[1])[:1000]
+                            for k, _ in to_del:
+                                sent.pop(k, None)
                 except Exception as e:
-                    logging.error(f"{sym} error: {e}")
-            time.sleep(POLL_SECONDS)
-        except KeyboardInterrupt:
-            logging.info("Stopped by user.")
-            break
+                    logging.error("%s analyze failed: %s", sym, e)
+
+            save_state(STATE_PATH, state)
         except Exception as e:
-            logging.error(f"Loop error: {e}")
-            time.sleep(5)
+            logging.error("Main loop error: %s", e)
+
+        time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
-    main_loop()
+    main()
