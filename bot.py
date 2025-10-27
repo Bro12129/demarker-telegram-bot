@@ -1,7 +1,7 @@
 # bot.py
 # -*- coding: utf-8 -*-
 import os, time, json, logging, requests, math
-from typing import List, Dict, Tuple, Set
+from typing import List, Tuple, Set
 
 # ---------------------- ENV ----------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
@@ -19,15 +19,19 @@ OS             = float(os.getenv("DEM_OS", "0.30"))
 BYBIT_BASE     = os.getenv("BYBIT_URL", "https://api.bybit.com")
 CATEGORY       = os.getenv("BYBIT_CATEGORY", "linear")  # linear | inverse | spot
 TICKERS        = [s.strip().upper() for s in os.getenv("TICKERS", "BTCUSDT").split(",") if s.strip()]
-TIMEFRAMES     = [s.strip() for s in os.getenv("TIMEFRAMES", "240").split(",") if s.strip()]  # минутные интервалы Bybit: 1,3,5,15,30,60,120,240,720,1440,10080, etc.
+TIMEFRAMES     = [s.strip() for s in os.getenv("TIMEFRAMES", "240").split(",") if s.strip()]  # Bybit minutes: 1..1440,10080
+
 KLINE_LIMIT    = int(os.getenv("KLINE_LIMIT", "200"))
 
 # Подтверждения
 CONFIRM_MODE   = os.getenv("CONFIRM_MODE", "any2").lower()  # any1 | any2
-# Сообщения — только символы, без слов
 MESSAGE_MINIMAL = os.getenv("MESSAGE_MINIMAL", "true").lower() == "true"
 
-# Состояние (для дедупа между рестартами)
+# «Молния»: какие ТФ сверять (по умолчанию 4h и 1D)
+LIGHTNING_FAST_TF = os.getenv("LIGHTNING_FAST_TF", "240")   # 4h
+LIGHTNING_SLOW_TF = os.getenv("LIGHTNING_SLOW_TF", "1440")  # 1D
+
+# Состояние (для дедупа)
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 
 # ---------------------- LOGGING ----------------------
@@ -79,7 +83,6 @@ def bybit_kline(symbol: str, interval: str, limit: int = 200):
 
 # ---------------------- INDICATORS ----------------------
 def demarker(high: List[float], low: List[float], length: int) -> List[float]:
-    # классический DeM
     demax, demin = [0.0]*len(high), [0.0]*len(low)
     for i in range(1, len(high)):
         demax[i] = max(high[i] - high[i-1], 0.0)
@@ -95,32 +98,39 @@ def demarker(high: List[float], low: List[float], length: int) -> List[float]:
             out[i] = smax / denom if denom > 0 else 0.5
     return out
 
+def last_closed_dem(high: List[float], low: List[float], length: int) -> float:
+    if len(high) < length + 2:  # нужно хотя бы length + 2 бара
+        return float("nan")
+    dem = demarker(high, low, length)
+    return dem[-2]  # строго закрытая свеча
+
 # ---------------------- CANDLE PATTERNS (включая фитильные) ----------------------
 def _rng(h,l): return max(h-l, 1e-12)
 def _body(o,c): return abs(c-o)
 def _upper_wick(h,o,c): return max(h - max(o,c), 0.0)
 def _lower_wick(l,o,c): return max(min(o,c) - l, 0.0)
 
-# Пороговые параметры (можно вынести в ENV при желании)
+# Пороговые параметры (ENV-переопределяемые)
 MIN_BODY_PCT       = float(os.getenv("W_MIN_BODY_PCT", "0.05"))
 SMALL_BODY_PCT     = float(os.getenv("W_SMALL_BODY_PCT","0.20"))
 DOJI_BODY_PCT      = float(os.getenv("W_DOJI_BODY_PCT","0.05"))
 LONG_WICK_RATIO    = float(os.getenv("W_LONG_WICK_RATIO","2.0"))
 TINY_WICK_TO_RANGE = float(os.getenv("W_TINY_WICK_TO_RANGE","0.05"))
 
-ENGULF_OVERLAP     = float(os.getenv("ENGULF_OVERLAP","0.10"))  # доля перекрытия тел
-# swing-фильтр для фитильных при желании
+ENGULF_OVERLAP     = float(os.getenv("ENGULF_OVERLAP","0.10"))
 NEED_SWING_WICKS   = os.getenv("W_NEED_SWING","false").lower()=="true"
 SWING_LEN_WICKS    = int(os.getenv("W_SWING_LEN","2"))
 
 def _swing_high(highs, i, L):
-    return all(highs[i] >= highs[i-k-1] for k in range(L)) and all(highs[i] > highs[i+k+1] for k in range(L) if i+k+1 < len(highs))
+    # безопасные границы
+    if i+L+1 > len(highs)-1 or i-L < 0: return True
+    return all(highs[i] >= highs[i-k-1] for k in range(L)) and all(highs[i] > highs[i+k+1] for k in range(L))
 
 def _swing_low(lows, i, L):
-    return all(lows[i] <= lows[i-k-1] for k in range(L)) and all(lows[i] < lows[i+k+1] for k in range(L) if i+k+1 < len(lows))
+    if i+L+1 > len(lows)-1 or i-L < 0: return True
+    return all(lows[i] <= lows[i-k-1] for k in range(L)) and all(lows[i] < lows[i+k+1] for k in range(L))
 
 def detect_wick_patterns(o,h,l,c,i) -> Tuple[Set[str], Set[str], Set[str]]:
-    """ Возвращает (bull_set, bear_set, all_set) по закрытой свече i """
     O,H,L,C = o[i], h[i], l[i], c[i]
     rng     = _rng(H,L); body=_body(O,C)
     upw     = _upper_wick(H,O,C); loww=_lower_wick(L,O,C)
@@ -143,16 +153,15 @@ def detect_wick_patterns(o,h,l,c,i) -> Tuple[Set[str], Set[str], Set[str]]:
     if loww >= LONG_WICK_RATIO*body and upw <= body*0.5 and bodyP >= MIN_BODY_PCT:
         bull.add("hammer_like"); allp.add("hammer_family")
 
-    # Shooting-star / inverted-hammer (bear)
+    # Shooting-star (bear)
     if upw  >= LONG_WICK_RATIO*body and loww <= body*0.5 and bodyP >= MIN_BODY_PCT:
         bear.add("shooting_star_like"); allp.add("inverted_hammer_family")
 
-    # Marubozu (почти без фитилей)
+    # Marubozu
     if upw/rng <= TINY_WICK_TO_RANGE and loww/rng <= TINY_WICK_TO_RANGE:
         if C > O: bull.add("marubozu_bull"); allp.add("marubozu_bull")
         elif C < O: bear.add("marubozu_bear"); allp.add("marubozu_bear")
 
-    # Свинг-фильтр (опционально)
     if NEED_SWING_WICKS:
         isSH = _swing_high(h, i, SWING_LEN_WICKS)
         isSL = _swing_low(l, i, SWING_LEN_WICKS)
@@ -163,22 +172,17 @@ def detect_wick_patterns(o,h,l,c,i) -> Tuple[Set[str], Set[str], Set[str]]:
     return bull, bear, bull|bear|allp
 
 def detect_body_patterns(o,h,l,c,i) -> Tuple[Set[str], Set[str], Set[str]]:
-    """ Классика: поглощение, харами, outside. Возвращает (bull_set, bear_set, all_set) """
     bull, bear, allp = set(), set(), set()
     if i-1 < 0: return bull, bear, allp
 
     O1,H1,L1,C1 = o[i-1], h[i-1], l[i-1], c[i-1]
     O2,H2,L2,C2 = o[i],   h[i],   l[i],   c[i]
     body1 = _body(O1,C1); body2 = _body(O2,C2)
-    rng1  = _rng(H1,L1);  rng2  = _rng(H2,L2)
-    if rng1<=0 or rng2<=0: return bull,bear,allp
 
-    # Engulfing (перекрытие тел не меньше ENGULF_OVERLAP доли)
-    # Bullish: вторая бычья, первая медвежья, тело2 > тело1 и О2 <= C1 - overlap && C2 >= O1 + overlap
+    # Engulfing (перекрытие тел не меньше ENGULF_OVERLAP доли от большего тела)
     overlap = ENGULF_OVERLAP * max(body1, 1e-12)
     if (C2 > O2) and (C1 < O1) and (body2 >= body1) and (O2 <= C1 - overlap) and (C2 >= O1 + overlap):
         bull.add("engulf_bull"); allp.add("engulf")
-    # Bearish
     if (C2 < O2) and (C1 > O1) and (body2 >= body1) and (O2 >= C1 + overlap) and (C2 <= O1 - overlap):
         bear.add("engulf_bear"); allp.add("engulf")
 
@@ -187,7 +191,7 @@ def detect_body_patterns(o,h,l,c,i) -> Tuple[Set[str], Set[str], Set[str]]:
         if C1 < O1 and C2 > O2: bull.add("harami_bull"); allp.add("harami")
         if C1 > O1 and C2 < O2: bear.add("harami_bear"); allp.add("harami")
 
-    # Outside bar (второй бар полностью покрывает первый по high/low)
+    # Outside bar
     if H2 >= H1 and L2 <= L1:
         if C2 > O2: bull.add("outside_bull"); allp.add("outside")
         if C2 < O2: bear.add("outside_bear"); allp.add("outside")
@@ -197,17 +201,14 @@ def detect_body_patterns(o,h,l,c,i) -> Tuple[Set[str], Set[str], Set[str]]:
 # ---------------------- SIGNAL ENGINE ----------------------
 def decide_signal(o,h,l,c):
     """
-    Решение по последней ЗАКРЫТОЙ свече (i = len(c)-2).
-    Возвращает: "long" | "short" | None
+    Возврат: "long" | "short" | None — только по текущему ТФ, закрытая свеча.
     """
     n = len(c)
     if n < max(DEM_LEN+5, 10): return None
-
-    i = n - 2  # строго закрытая свеча
+    i = n - 2  # закрытая
 
     # DeMarker
-    dem = demarker(h, l, DEM_LEN)
-    dem_val = dem[i]
+    dem_val = last_closed_dem(h, l, DEM_LEN)
     dem_long  = (not math.isnan(dem_val)) and dem_val <= OS
     dem_short = (not math.isnan(dem_val)) and dem_val >= OB
 
@@ -215,7 +216,6 @@ def decide_signal(o,h,l,c):
     bull_w, bear_w, _ = detect_wick_patterns(o,h,l,c,i)
     bull_b, bear_b, _ = detect_body_patterns(o,h,l,c,i)
 
-    # Подсчёт подтверждений
     conf_long  = 0
     conf_short = 0
     if dem_long:  conf_long  += 1
@@ -231,12 +231,40 @@ def decide_signal(o,h,l,c):
     if go_short: return "short"
     return None
 
+def lightning_align(sym: str) -> str:
+    """
+    Проверяет выравнивание DeMarker на двух ТФ (fast=4h, slow=1D).
+    Возвращает: "bull" | "bear" | "" (нет совпадения)
+    """
+    try:
+        oF,hF,lF,cF = bybit_kline(sym, LIGHTNING_FAST_TF, KLINE_LIMIT)
+        oS,hS,lS,cS = bybit_kline(sym, LIGHTNING_SLOW_TF, KLINE_LIMIT)
+    except Exception as e:
+        logging.error(f"Lightning kline error {sym}: {e}")
+        return ""
+
+    demF = last_closed_dem(hF, lF, DEM_LEN)
+    demS = last_closed_dem(hS, lS, DEM_LEN)
+
+    if math.isnan(demF) or math.isnan(demS):
+        return ""
+
+    both_bull = (demF <= OS) and (demS <= OS)
+    both_bear = (demF >= OB)  and (demS >= OB)
+
+    if both_bull: return "bull"
+    if both_bear: return "bear"
+    return ""
+
 # ---------------------- MAIN LOOP ----------------------
 def main():
-    state = load_state()  # ключ: f"{symbol}|{tf}" -> { "last_ts": int, "last_sig": "long/short/none" }
+    state = load_state()  # ключ: f"{symbol}|{tf}" -> { "last_ts": int, "last_sig": "long/short/none", "last_light": "" }
     while True:
         try:
             for sym in TICKERS:
+                # вычислим статус «молнии» один раз на символ
+                light_dir = lightning_align(sym)  # "bull"/"bear"/""
+
                 for tf in TIMEFRAMES:
                     try:
                         o,h,l,c = bybit_kline(sym, tf, KLINE_LIMIT)
@@ -244,25 +272,32 @@ def main():
                         logging.error(f"Kline error {sym} {tf}: {e}")
                         continue
 
-                    sig = decide_signal(o,h,l,c)
+                    sig = decide_signal(o,h,l,c)  # "long"/"short"/None
+
                     key = f"{sym}|{tf}"
                     last = state.get(key, {})
-                    last_sig = last.get("last_sig")
-                    last_ts  = last.get("last_ts", 0)
+                    last_sig  = last.get("last_sig")
+                    last_ts   = last.get("last_ts", 0)
+                    last_l    = last.get("last_light", "")
 
-                    # Используем timestamp последней закрытой свечи как "версию"
-                    # Для v5 list[i][0] — открытие бара (ms). Здесь у нас его нет — но мы шагаем по длине.
-                    bar_version = len(c) - 2
+                    bar_version = len(c) - 2  # номер закрытого бара
 
-                    if sig and (sig != last_sig or bar_version != last_ts):
-                        # отправляем только символы
-                        if MESSAGE_MINIMAL:
-                            send_tg("▲" if sig == "long" else "▼")
-                        else:
-                            # резерв: подробное (не используется, но оставлено)
-                            send_tg(f"{'LONG' if sig=='long' else 'SHORT'}")
-                        state[key] = {"last_sig": sig, "last_ts": bar_version}
-                        save_state(state)
+                    if sig:
+                        # добавим ⚡, если направления совпадают и оба ТФ (4h/1D) в одной зоне
+                        add_light = (light_dir == "bull" and sig == "long") or (light_dir == "bear" and sig == "short")
+                        out = "▲" if sig == "long" else "▼"
+                        if add_light:
+                            out = f"{out}⚡"
+
+                        # анти-дубль: не слать один и тот же результат на тот же закрытый бар
+                        if sig != last_sig or bar_version != last_ts or (add_light and last_l == "") or ((not add_light) and last_l != ""):
+                            if MESSAGE_MINIMAL:
+                                send_tg(out)
+                            else:
+                                send_tg(out)  # слов не добавляем, оставляем минимализм
+                            state[key] = {"last_sig": sig, "last_ts": bar_version, "last_light": ("bull" if add_light and sig=="long" else "bear" if add_light and sig=="short" else "")}
+                            save_state(state)
+
         except Exception as e:
             logging.error(f"Loop error: {e}")
 
