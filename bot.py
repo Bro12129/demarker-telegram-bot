@@ -1,166 +1,158 @@
-# bot.py — финальная версия (~70 тикеров: crypto + metals + indices + stocks)
+# --- SETTINGS HOTFIX ---
+USE_CLOSED_ONLY = True
+CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")  # linear|inverse|spot
+TF_4H = "240"
+TF_1D = "D"
+MAX_RETRIES_TG = 3
 
-import os, time, json, logging, requests, re
-from typing import List, Dict
-from urllib.parse import urlparse
-
-# ===== ENV =====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
-CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
-TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
-DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
-OB             = float(os.getenv("DEM_OB", "0.70"))
-OS             = float(os.getenv("DEM_OS", "0.30"))
-STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
-
-# ===== BYBIT URL =====
-def _bybit_base():
-    raw = os.getenv("BYBIT_URL", "https://api.bybit.com")
-    u = urlparse(raw if "://" in raw else f"https://{raw}")
-    return f"{u.scheme or 'https'}://{u.netloc or u.path or 'api.bybit.com'}"
-
-BYBIT_BASE = _bybit_base()
-BYBIT_KLINE_URL = f"{BYBIT_BASE}/v5/market/kline"
-
-def fetch_kline(symbol, interval, limit=200, category="linear", timeout=20):
-    params = {"category": category, "symbol": symbol, "interval": str(interval), "limit": str(limit)}
-    r = requests.get(BYBIT_KLINE_URL, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-# ===== LOGGING =====
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# ===== UTIL =====
-def load_state():
-    if os.path.exists(STATE_PATH):
+# --- SAFE TELEGRAM SENDER ---
+def tg_send(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.error("Telegram creds missing")
+        return False
+    for i in range(MAX_RETRIES_TG):
         try:
-            return json.load(open(STATE_PATH))
-        except:
-            return {}
-    return {}
-
-def save_state(state):
-    try: json.dump(state, open(STATE_PATH, "w"))
-    except Exception as e: logging.error("Save state error: %s", e)
-
-def send_tg(symbol, text):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return
-    try:
-        requests.post(TG_API, data={"chat_id": CHAT_ID, "text": f"{symbol} {text}".strip(),
-                                    "disable_notification": True}, timeout=10)
-    except Exception as e: logging.error("TG send error: %s", e)
-
-# ===== TICKERS (≈70 total) =====
-def parse_symbols():
-    default = (
-        # --- Crypto (40) ---
-        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,PEPEUSDT,"
-        "TONUSDT,SHIBUSDT,LTCUSDT,LINKUSDT,TRXUSDT,MATICUSDT,DOTUSDT,APTUSDT,ARBUSDT,"
-        "OPUSDT,SUIUSDT,NEARUSDT,ATOMUSDT,SEIUSDT,XLMUSDT,ETCUSDT,INJUSDT,TIAUSDT,"
-        "AAVEUSDT,UNIUSDT,MKRUSDT,IMXUSDT,FILUSDT,BLURUSDT,GALAUSDT,THETAUSDT,"
-        "ICPUSDT,SANDUSDT,MANAUSDT,FTMUSDT,EOSUSDT,"
-        # --- Metals & commodities ---
-        "PAXGUSDT,SILVERUSDT,PLATUSDT,PALLUSDT,COPPERUSDT,WTIUSDT,BRENTUSDT,NATGASUSDT,URANIUMUSDT,"
-        # --- Indices ---
-        "SP500USDT,NAS100USDT,DJ30USDT,RUS2000USDT,DXYUSDT,VIXUSDT,"
-        # --- Tokenized stocks ---
-        "AAPLUSDT,TSLAUSDT,NVDAUSDT,METAUSDT,MSFTUSDT,GOOGUSDT,AMZNUSDT"
-    )
-    raw = os.getenv("TICKERS", os.getenv("SYMBOLS", default))
-    parts = [p.strip().upper() for p in re.split(r"[,\s]+", raw) if p.strip()]
-    return list(dict.fromkeys(parts))
-
-SYMBOLS = parse_symbols()
-
-# ===== DeMarker =====
-def demarker_from_candles(candles, length=DEM_LEN):
-    if len(candles) < length + 1: return 0.5
-    highs = [float(c[2]) for c in candles][- (length + 1):]
-    lows  = [float(c[3]) for c in candles][- (length + 1):]
-    up = dn = 0.0
-    for i in range(1, len(highs)):
-        up += max(highs[i] - highs[i-1], 0)
-        dn += max(lows[i-1] - lows[i], 0)
-    return up / (up + dn) if up + dn else 0.5
-
-def zone(val):
-    if val >= OB: return "overbought"
-    if val <= OS: return "oversold"
-    return "neutral"
-
-# ===== Candle patterns =====
-def classify_long_wick_patterns_last_closed(candles):
-    if not candles: return []
-    o,h,l,c = map(float, candles[-1][1:5])
-    body = abs(c - o) or 1e-8; rng = max(h - l, 1e-8)
-    upper = max(h - max(o, c), 0.0); lower = max(min(o, c) - l, 0.0)
-    b, u, d = body/rng, upper/rng, lower/rng
-    SMALL_BODY, LONG_WICK, DOJI_BODY = 0.3, 2.0, 0.1
-    labels=[]
-    if lower>LONG_WICK*body and c>o: labels.append("bullish_pin")
-    if upper>LONG_WICK*body and c<o: labels.append("bearish_pin")
-    if b<=SMALL_BODY and lower>=LONG_WICK*body: labels.append("hammer_hanging")
-    if b<=SMALL_BODY and upper>=LONG_WICK*body: labels.append("star_inverted")
-    if b<=DOJI_BODY:
-        if d>=0.6 and u<=0.15: labels.append("dragonfly_doji")
-        elif u>=0.6 and d<=0.15: labels.append("gravestone_doji")
-        elif u>=0.35 and d>=0.35: labels.append("long_legged_doji")
-    return labels
-
-def signals_from_patterns(labels, z):
-    out=[]
-    for lb in labels:
-        if lb in {"bullish_pin","dragonfly_doji"} and z=="oversold": out.append("🟢⬆️")
-        elif lb in {"bearish_pin","gravestone_doji"} and z=="overbought": out.append("🔴⬇️")
-        elif lb in {"hammer_hanging","star_inverted","long_legged_doji"}:
-            if z=="oversold": out.append("🟢⬆️")
-            elif z=="overbought": out.append("🔴⬇️")
-    return out
-
-# ===== MAIN LOOP =====
-state=load_state()
-logging.info("Start bot with %d symbols...",len(SYMBOLS))
-
-while True:
-    for sym in SYMBOLS:
-        try:
-            r4=fetch_kline(sym,"240",limit=200,category="linear")
-            r1=fetch_kline(sym,"D",limit=200,category="linear")
-            kl4=r4.get("result",{}).get("list",[]) or []
-            kl1=r1.get("result",{}).get("list",[]) or []
-            if len(kl4)<DEM_LEN+1 or len(kl1)<DEM_LEN+1: continue
-
-            d4=demarker_from_candles(kl4); d1=demarker_from_candles(kl1)
-            z4,z1=zone(d4),zone(d1)
-            labs4=classify_long_wick_patterns_last_closed(kl4)
-            labs1=classify_long_wick_patterns_last_closed(kl1)
-
-            k4=f"{sym}:{kl4[-1][0]}:4h"; k1=f"{sym}:{kl1[-1][0]}:1d"
-            kL=f"{sym}:{kl4[-1][0]}:{kl1[-1][0]}:lightning"
-            parts=[]
-
-            if z4==z1 and z4 in ("overbought","oversold") and state.get(kL)!=1:
-                parts.append("⚡️"); state[kL]=1
-
-            for lb in labs4:
-                kk=f"{k4}:{lb}"
-                if state.get(kk)==1: continue
-                for s in signals_from_patterns([lb],z4): parts.append(s); state[kk]=1
-
-            for lb in labs1:
-                kk=f"{k1}:{lb}"
-                if state.get(kk)==1: continue
-                for s in signals_from_patterns([lb],z1): parts.append(s); state[kk]=1
-
-            if parts: send_tg(sym,"".join(parts))
-
-        except requests.HTTPError as e:
-            logging.error("%s: HTTP error: %s",sym,e)
+            r = requests.post(TG_API, json={"chat_id": CHAT_ID, "text": text})
+            if r.status_code == 200:
+                return True
+            logging.warning(f"TG send {r.status_code}: {r.text}")
+            # 429 backoff
+            time.sleep(1 + i * 2)
         except Exception as e:
-            logging.error("%s: %s",sym,e)
+            logging.exception(f"TG send err: {e}")
+            time.sleep(1 + i * 2)
+    return False
 
-    save_state(state)
-    time.sleep(POLL_SECONDS)
+# --- BYBIT KLINES (всегда берём закрытую) ---
+def bybit_klines(symbol: str, interval: str, limit: int = 200):
+    url = f"{BYBIT_KLINE_URL}"
+    # Пример: https://api.bybit.com/v5/market/kline
+    params = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "interval": interval,
+        "limit": str(max(2, limit))
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json().get("result", {}).get("list", [])
+    data = sorted(data, key=lambda x: int(x[0]))  # сорт по open time
+    if USE_CLOSED_ONLY and len(data) >= 2:
+        data = data[:-1]  # срезаем текущую незакрытую
+    return data  # элементы формата [openTime, open, high, low, close, volume, ...] (строки)
+
+# --- DEMARKER 28 на закрытых барах ---
+def calc_demarker(closes, highs, lows, length=DEM_LEN):
+    up, dn = [], []
+    for i in range(1, len(closes)):
+        up.append(max(0.0, float(highs[i]) - float(highs[i-1])))
+        dn.append(max(0.0, float(lows[i-1]) - float(lows[i])))
+    # выравниваем длины
+    n = min(len(up), len(dn))
+    up, dn = up[-n:], dn[-n:]
+    dem = []
+    for i in range(length, n):
+        su = sum(up[i-length:i])
+        sd = sum(dn[i-length:i])
+        denom = (su + sd) if (su + sd) > 0 else 1e-12
+        dem.append(su / denom)
+    return dem  # массив по закрытым барам (без последнего незакрытого)
+
+# --- ПИН-БАР/ФИТИЛИ (на закрытом баре) ---
+def is_pinbar(o, h, l, c, body_ratio=0.33, wick_ratio=2.0):
+    o, h, l, c = map(float, (o, h, l, c))
+    body = abs(c - o)
+    range_ = max(1e-12, h - l)
+    upper = h - max(c, o)
+    lower = min(c, o) - l
+    # маленькое тело и длинный один фитиль
+    if body / range_ > body_ratio:
+        return False
+    return (upper >= wick_ratio * body) or (lower >= wick_ratio * body)
+
+def detect_candle_signal(o, h, l, c):
+    # ↑ зелёная стрелка при бычьем пин-баре, ↓ при медвежьем
+    if is_pinbar(o, h, l, c):
+        if float(c) > float(o):
+            return "🟢⬆️"   # buy-hint
+        else:
+            return "🔴⬇️"   # sell-hint
+    return ""
+
+# --- ДЕДУП КЛЮЧ (символ+TF+время бара+тип) ---
+def make_key(symbol: str, tf: str, bar_open_ms: int, kind: str):
+    return f"{symbol}|{tf}|{bar_open_ms}|{kind}"
+
+# --- СИГНАЛЫ ---
+def evaluate_symbol(symbol: str):
+    out_messages = []
+
+    # 4H
+    k4 = bybit_klines(symbol, TF_4H, limit=DEM_LEN+50)
+    if len(k4) < DEM_LEN+2:
+        return out_messages
+    open_ms_4 = int(k4[-1][0])
+    o4, h4, l4, c4 = k4[-1][1], k4[-1][2], k4[-1][3], k4[-1][4]
+    closes4 = [x[4] for x in k4]
+    highs4  = [x[2] for x in k4]
+    lows4   = [x[3] for x in k4]
+    dem4 = calc_demarker(closes4, highs4, lows4, DEM_LEN)
+    dem4_last = dem4[-1]
+
+    # 1D
+    kd = bybit_klines(symbol, TF_1D, limit=DEM_LEN+50)
+    if len(kd) < DEM_LEN+2:
+        return out_messages
+    open_ms_d = int(kd[-1][0])
+    od, hd, ld, cd = kd[-1][1], kd[-1][2], kd[-1][3], kd[-1][4]
+    closesd = [x[4] for x in kd]
+    highsd  = [x[2] for x in kd]
+    lowsd   = [x[3] for x in kd]
+    demd = calc_demarker(closesd, highsd, lowsd, DEM_LEN)
+    demd_last = demd[-1]
+
+    # свечные сигналы (только закрытые свечи)
+    candle4 = detect_candle_signal(o4, h4, l4, c4)
+    candled = detect_candle_signal(od, hd, ld, cd)
+
+    # базовые сигналы по DeM
+    sig4 = "🟢⬆️" if dem4_last <= OS else ("🔴⬇️" if dem4_last >= OB else "")
+    sigd = "🟢⬆️" if demd_last <= OS else ("🔴⬇️" if demd_last >= OB else "")
+
+    # ⚡ если 4H и 1D в одной зоне (обе выше OB или обе ниже OS)
+    lightning = ""
+    if (dem4_last >= OB and demd_last >= OB) or (dem4_last <= OS and demd_last <= OS):
+        lightning = "⚡"
+
+    # комбинируем по твоему правилу «минимум два сигнала»
+    candidates = []
+    # 4H пакет
+    pack4 = [x for x in [sig4, candle4] if x]
+    if len(pack4) >= 2:
+        candidates.append(("4H", pack4))
+    # 1D пакет
+    packd = [x for x in [sigd, candled] if x]
+    if len(packd) >= 2:
+        candidates.append(("1D", packd))
+    # ⚡ отдельный
+    if lightning:
+        candidates.append(("⚡", [lightning]))
+
+    # отправка с дедупом
+    state = load_state()  # твоя функция чтения json
+    changed = False
+    for tf, tokens in candidates:
+        # время ключа — время закрытой свечи соответствующего TF
+        bar_time = open_ms_4 if tf in ("4H", "⚡") else open_ms_d
+        kind = "".join(tokens)
+        key = make_key(symbol, tf, bar_time, kind)
+        if key not in state:
+            # сообщение без слов — только символы
+            text = f"{symbol} {''.join(tokens)}"
+            if tg_send(text):
+                state[key] = int(time.time())
+                changed = True
+    if changed:
+        save_state(state)  # твоя функция записи json
+
+    return out_messages
