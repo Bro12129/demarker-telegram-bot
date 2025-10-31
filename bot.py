@@ -1,8 +1,9 @@
-# bot.py — BingX only, PERP-only universe (no spot). Auto-picks crypto majors, US indices PERP,
-# tokenized stocks PERP (AAPLX, NVDAX, etc. if available), FX-PERP, metals. Signals per your spec.
+# bot.py — BingX PERP-only scanner (no spot).
+# Signals: DeMarker-28 (4H & 1D), Wick≥25%, Engulfing after ≥2 opposite candles.
+# Alerts: only symbol text. Types: LIGHT / L+CAN / 1TF+CAN (stored in dedup state, not in message).
 
-import os, time, json, logging, requests, re
-from typing import List, Dict, Tuple, Any, Set
+import os, time, json, logging, requests
+from typing import List, Dict, Tuple, Any
 
 # ===================== ENV =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
@@ -21,56 +22,46 @@ STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 
 # BingX REST (PERP)
 BINGX_BASE     = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
-KLINE_EP       = "/openApi/swap/v3/quote/klines"      # symbol, klineType in {1min..,4h,1D,...}, limit, startTime/endTime
-CONTRACTS_EP   = "/openApi/swap/v2/quote/contracts"   # все деривативные контракты
+KLINE_EP       = "/openApi/swap/v3/quote/klines"      # symbol, klineType in {'4h','1D',...}, limit
+CONTRACTS_EP   = "/openApi/swap/v2/quote/contracts"   # список деривативных контрактов (на будущее)
 
-# --------- Управление вселенной тикеров (ТОЛЬКО PERP) ----------
-# Жёсткая фиксация состава (перечень символов PERP через запятую) — опционально:
+# Интревалы (не меняем названия — удобно править из ENV при желании)
+KLINE_4H       = os.getenv("KLINE_4H", "4h")
+KLINE_1D       = os.getenv("KLINE_1D", "1D")
+
+# --------- ФИКСИРОВАННЫЙ СОСТАВ ТИКЕРОВ (PERP, без spot) ----------
+# Можно переопределить через ENV, если очень нужно:
 TICKERS_CSV_PERP = os.getenv("TICKERS_CSV_PERP", "").strip()
 
-# Принудительное ДОБАВЛЕНИЕ (если свежие листинги/редкие тикеры)
-FORCE_INCLUDE_CSV = os.getenv("FORCE_INCLUDE_CSV", "").strip()   # напр. "SPXUSDT,AAPLXUSDT"
+DEFAULT_TICKERS = [
+    # ===== Криптовалюты (~30) =====
+    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","ADAUSDT","DOGEUSDT","TRXUSDT",
+    "LINKUSDT","MATICUSDT","DOTUSDT","AVAXUSDT","ATOMUSDT","LTCUSDT","BCHUSDT","NEARUSDT",
+    "APTUSDT","ARBUSDT","OPUSDT","SUIUSDT","SEIUSDT","INJUSDT","FILUSDT","RNDRUSDT",
+    "TONUSDT","UNIUSDT","AAVEUSDT","ETCUSDT","FTMUSDT","THETAUSDT",
 
-# Принудительное ИСКЛЮЧЕНИЕ (по подстрокам; по умолчанию убираем все '1000' контракты)
-FORCE_EXCLUDE_CSV = os.getenv("FORCE_EXCLUDE_CSV", "1000").strip()
+    # ===== Драгметаллы (PERP) =====
+    "XAUUSDT","XAGUSDT",
 
-# Базовый набор ~30 крипто-мейджоров (USDT-PERP). Можно допилить под себя.
-CRYPTO_MAJORS_30 = [s.strip().upper() for s in """
-BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,
-LINKUSDT,MATICUSDT,DOTUSDT,AVAXUSDT,ATOMUSDT,LTCUSDT,BCHUSDT,NEARUSDT,
-APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,SEIUSDT,INJUSDT,FILUSDT,RNDRUSDT,
-TONUSDT,UNIUSDT,AAVEUSDT,ETCUSDT,FTMUSDT,THETAUSDT
-""".replace("\n","").split(",") if s.strip()]
+    # ===== Индексы США (PERP) =====
+    "SPXUSDT","NAS100USDT","US30USDT","US2000USDT","VIXUSDT",
 
-# Металлы PERP (у BingX есть золото/серебро и т. п. в разных видах; тянем USDT-маржин. формы)
-METALS_WHITELIST = [s.strip().upper() for s in os.getenv(
-    "METALS_WHITELIST",
-    "XAUUSDT,XAGUSDT"   # золото/серебро USDT-маржин PERP на BingX
-).split(",") if s.strip()]
+    # ===== Валютные пары (Forex PERP) =====
+    "EURUSD","GBPUSD","AUDUSD","NZDUSD","USDJPY","USDCHF","USDCAD",
+    "USDCNH","USDHKD","USDTRY","USDMXN","USDZAR",
 
-# Индексы США (S&P/NASDAQ/DOW/Russell/VIX) — типичные нейминги у BingX: SPXUSDT, NAS100USDT, US30USDT, US2000USDT, VIXUSDT
-INDEX_REGEX = os.getenv(
-    "INDEX_REGEX",
-    r"^(SPXUSDT|SP500USDT|US500USDT|ESUSDT|NAS100USDT|NDXUSDT|US100USDT|NQUSDT|DOWUSDT|DJIUSDT|US30USDT|YMUSDT|RUTUSDT|US2000USDT|RTYUSDT|VIXUSDT)$"
-)
+    # ===== Токенизированные акции (PERP) =====
+    "AAPLXUSDT","TSLAXUSDT","NVDAXUSDT","AMZNXUSDT","MSFTXUSDT",
+    "METAUSDT","COINXUSDT","GOOGXUSDT","NFLXXUSDT","AMDUSDT","NVDAUSDT",
+    "INTCXUSDT","SNOWXUSDT","SHOPXUSDT","BABAUSDT",
+]
 
-# FX-PERP у BingX: EURUSD, GBPUSD, AUDUSD, NZDUSD, USDJPY, USDCHF, USDCAD и т. п. (м.б. без суффикса USDT)
-FX_REGEX = os.getenv(
-    "FX_REGEX",
-    r"^(EURUSD|GBPUSD|AUDUSD|NZDUSD|USDJPY|USDCHF|USDCAD|USDCNH|USDHKD|USDTRY|USDMXN|USDZAR|USDNOK|USDSGD|USDDKK|USDSEK|USDRUB|XAUUSD|XAGUSD)$"
-)
+def load_tickers() -> List[str]:
+    if TICKERS_CSV_PERP:
+        return [s.strip().upper() for s in TICKERS_CSV_PERP.split(",") if s.strip()]
+    return DEFAULT_TICKERS[:]
 
-# Токенизированные акции/активы в PERP: AAPLXUSDT, NVDAXUSDT, COINXUSDT, AMZNXUSDT, METAXUSDT и т.п.
-XSTOCK_PERP_REGEX = os.getenv(
-    "XSTOCK_PERP_REGEX",
-    r"^[A-Z0-9]+XUSDT$"
-)
-
-# Интервалы для свече-анализа
-KLINE_4H = os.getenv("KLINE_4H", "4h")
-KLINE_1D = os.getenv("KLINE_1D", "1D")
-
-# -------------------- LOGGING --------------------
+# ===================== LOGGING =====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 # ===================== UTILS =====================
@@ -104,103 +95,17 @@ def http_get(path: str, params: Dict[str, Any], timeout: int = 15) -> Dict[str, 
     r.raise_for_status()
     return r.json()
 
-# ===================== BINGX MARKET =====================
-def fetch_all_perp_symbols() -> Set[str]:
-    """
-    Тянем все деривативные контракты BingX (swap), возвращаем множество символов, которые:
-    - активны,
-    - являются perpetual (без экспирации),
-    - маржин. линейные (USDT/USDC/и т.п.).
-    """
-    symbols: Set[str] = set()
-    try:
-        data = http_get(CONTRACTS_EP, params={})
-        # формат Zendesk: /openApi/swap/v2/quote/contracts — базовая таблица деривативов
-        # Ожидаем в result список с полями symbol, status, contractType и т.п.
-        result = data.get("data") or data.get("result") or data.get("res") or data
-        lst = result.get("contracts") if isinstance(result, dict) else None
-        if lst is None and isinstance(result, list):
-            lst = result
-
-        if not lst:
-            # некоторые окружения отдают сразу list в data
-            lst = data.get("data") if isinstance(data.get("data"), list) else []
-
-        for it in (lst or []):
-            sym  = str(it.get("symbol","")).upper()
-            stat = str(it.get("status","") or it.get("state","")).lower()  # trading / online ...
-            ctyp = (it.get("contractType") or it.get("type") or "").lower()  # LinearPerpetual / Perpetual ...
-            if not sym:
-                continue
-            if stat and stat not in ("trading","online","tradable","on"):
-                continue
-            if "perpetual" not in ctyp and "swap" not in ctyp:
-                # пропускаем dated futures / нестандарт
-                continue
-            symbols.add(sym)
-    except Exception as e:
-        logging.warning(f"contracts fetch error: {e}")
-    return symbols
-
-def apply_force_filters(symbols: List[str]) -> List[str]:
-    excl = [s.strip().upper() for s in FORCE_EXCLUDE_CSV.split(",") if s.strip()]
-    if excl:
-        symbols = [s for s in symbols if all(ex not in s for ex in excl)]
-    incl = [s.strip().upper() for s in FORCE_INCLUDE_CSV.split(",") if s.strip()]
-    for s in incl:
-        if s not in symbols:
-            symbols.append(s)
-    return symbols
-
-def resolve_perp_universe() -> List[str]:
-    """
-    Конечная вселенная ТОЛЬКО PERP (без spot):
-      1) Жёсткий CSV → используем как есть (плюс force include/exclude).
-      2) Иначе: пересечение
-         • ~30 крипто-мейджоров,
-         • металлы (XAUUSDT, XAGUSDT),
-         • индексы США PERP (по INDEX_REGEX),
-         • FX-PERP (по FX_REGEX),
-         • токенизированные акции PERP (по XSTOCK_PERP_REGEX)
-       с реальным списком контрактов BingX.
-    """
-    if TICKERS_CSV_PERP:
-        base = [s.strip().upper() for s in TICKERS_CSV_PERP.split(",") if s.strip()]
-        return apply_force_filters(list(dict.fromkeys(base)))
-
-    have = fetch_all_perp_symbols()
-    if not have:
-        # fallback — хотя бы крипто-мейджоры + металлы (часто есть везде)
-        logging.warning("Could not fetch BingX PERP universe; fallback to majors+metals only.")
-        base = list(dict.fromkeys(CRYPTO_MAJORS_30 + METALS_WHITELIST))
-        return apply_force_filters(base)
-
-    idx_re    = re.compile(INDEX_REGEX, re.IGNORECASE)
-    fx_re     = re.compile(FX_REGEX, re.IGNORECASE)
-    xstock_re = re.compile(XSTOCK_PERP_REGEX, re.IGNORECASE)
-
-    majors_ok  = [s for s in CRYPTO_MAJORS_30 if s in have]
-    metals_ok  = [s for s in METALS_WHITELIST if s in have]
-    indices_ok = [s for s in have if idx_re.match(s)]
-    fx_ok      = [s for s in have if fx_re.match(s)]
-    xstock_ok  = [s for s in have if xstock_re.match(s)]
-
-    base = list(dict.fromkeys(majors_ok + metals_ok + indices_ok + fx_ok + xstock_ok))
-    if not base:
-        logging.warning("Empty universe after filters; fallback to majors+metals.")
-        base = list(dict.fromkeys([s for s in (CRYPTO_MAJORS_30 + METALS_WHITELIST) if s in have]))
-    return apply_force_filters(base)
-
+# ===================== MARKET =====================
 def get_klines(symbol: str, kline_type: str, limit: int = 500) -> List[Dict[str, Any]]:
     """
     BingX candles (PERP): /openApi/swap/v3/quote/klines
-    klineType: '4h' / '1D' и др. Возвращаем последние ЗАКРЫТЫЕ свечи в хронологическом порядке.
+    Возвращает ЗАКРЫТЫЕ бары в хронологическом порядке [{open,high,low,close,start}, ...]
     """
     params = {"symbol": symbol, "klineType": kline_type, "limit": str(limit)}
     try:
         data = http_get(KLINE_EP, params=params)
-        # форматы различаются по окружениям; ищем массив свечей в data / result
         rows = None
+        # ищем массив свечей в разных возможных ключах
         for key in ("data", "result", "klines", "candles"):
             v = data.get(key)
             if isinstance(v, list):
@@ -212,18 +117,17 @@ def get_klines(symbol: str, kline_type: str, limit: int = 500) -> List[Dict[str,
         if rows is None and isinstance(data, list):
             rows = data
 
-        bars = []
+        bars: List[Dict[str, Any]] = []
         for it in rows or []:
-            # ожидаемый формат: [openTime, open, high, low, close, volume, ...] либо dict
-            if isinstance(it, list) and len(it) >= 6:
-                o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4]); t = int(it[0])
+            # формат либо list [openTime, open, high, low, close, ...], либо dict
+            if isinstance(it, list) and len(it) >= 5:
+                t = int(it[0]); o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
             elif isinstance(it, dict):
                 t = int(it.get("openTime") or it.get("time") or it.get("startTime"))
                 o = float(it.get("open")); h = float(it.get("high")); l = float(it.get("low")); c = float(it.get("close"))
             else:
                 continue
             bars.append({"open": o, "high": h, "low": l, "close": c, "start": t})
-        # Хронология: гарантируем от старой к новой
         bars.sort(key=lambda x: x["start"])
         return bars
     except Exception as e:
@@ -255,6 +159,7 @@ def _color(o: float, c: float) -> int:
     return 1 if c > o else (-1 if c < o else 0)  # 1=green, -1=red, 0=doji
 
 def _engulf(curr_o: float, curr_c: float, prev_o: float, prev_c: float, bullish: bool) -> bool:
+    # классическое поглощение телом
     if bullish:
         return (curr_c > curr_o) and (prev_c < prev_o) and (curr_o <= prev_c) and (curr_c >= prev_o)
     else:
@@ -307,12 +212,14 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     dem1d = demarker_last(highs(k1d), lows(k1d), DEM_LEN)
     bothOB, bothOS, oneOB, oneOS = zone_flags(dem4h, dem1d, DEM_OB, DEM_OS)
 
+    # Wick≥25% на последнем закрытом баре каждого ТФ
     o4,h4,l4,c4 = k4h[-1]["open"], k4h[-1]["high"], k4h[-1]["low"], k4h[-1]["close"]
     o1,h1,l1,c1 = k1d[-1]["open"], k1d[-1]["high"], k1d[-1]["low"], k1d[-1]["close"]
     u4,lw4 = wick25_flags(o4,h4,l4,c4)
     u1,lw1 = wick25_flags(o1,h1,l1,c1)
     wick_any = (u4 or lw4 or u1 or lw1)
 
+    # Engulfing (только после серии ≥2 противоположных свечей) на каждом ТФ
     bull_eng_4h, bear_eng_4h = engulfing_after_two_or_more(k4h)
     bull_eng_1d, bear_eng_1d = engulfing_after_two_or_more(k1d)
     engulf_any = (bull_eng_4h or bear_eng_4h or bull_eng_1d or bear_eng_1d)
@@ -340,9 +247,9 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
 
 # ===================== MAIN LOOP =====================
 def main():
-    tickers = resolve_perp_universe()
+    tickers = load_tickers()
     if not tickers:
-        logging.error("No PERP symbols resolved on BingX. Adjust ENV or regex filters.")
+        logging.error("No PERP symbols configured.")
         return
 
     state = load_state(STATE_PATH)
