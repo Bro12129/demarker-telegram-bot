@@ -188,6 +188,7 @@ def _color(o: float, c: float) -> int:
     return 1 if c > o else (-1 if c < o else 0)
 
 def _engulf(o1: float, c1: float, o2: float, c2: float, bullish: bool) -> bool:
+    # Сравнение ТОЛЬКО по телам свечей (open/close)
     if bullish:
         return (c1 > o1) and (c2 < o2) and (o1 <= c2) and (c1 >= o2)
     else:
