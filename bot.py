@@ -1,6 +1,6 @@
-# bot.py — Quiet mode (only 3 startup lines), BingX PERP scanner
+# bot.py — Quiet mode + Telegram send diagnostics (1-line warn on failure)
 # Signals: DeMarker-28 (4H & 1D, last CLOSED bar), Wick≥25% (independent),
-#          Engulfing only after ≥2 consecutive opposite-color candles (by bodies).
+#          Engulfing only after ≥2 opposite-color candles (by bodies).
 # Alerts: only symbol text. Types: LIGHT / L+CAN / 1TF+CAN (dedup in state).
 
 import os, time, json, logging, requests
@@ -23,17 +23,17 @@ STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 
 # BingX REST (PERP)
 BINGX_BASE     = os.getenv("BINGX_BASE", "https://open-api.bingx.com").rstrip("/")
-KLINE_EP       = "/openApi/swap/v3/quote/klines"      # symbol, klineType {'4h','1d',...}, limit
-CONTRACTS_EP   = "/openApi/swap/v2/quote/contracts"   # список PERP контрактов
+KLINE_EP       = "/openApi/swap/v3/quote/klines"
+CONTRACTS_EP   = "/openApi/swap/v2/quote/contracts"
 
 # Таймфреймы
 KLINE_4H       = os.getenv("KLINE_4H", "4h")
-KLINE_1D       = os.getenv("KLINE_1D", "1d")  # важно: нижний регистр
+KLINE_1D       = os.getenv("KLINE_1D", "1d")
 
-# Тихое логирование: только WARNING/ERROR
+# Тихое логирование
 logging.basicConfig(level=logging.WARNING)
 
-# Резервный статический список (фолбэк)
+# Резервный фолбэк
 DEFAULT_TICKERS = [
     "BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","BNB-USDT","ADA-USDT","DOGE-USDT","TRX-USDT",
     "XAU-USDT","XAG-USDT",
@@ -60,12 +60,26 @@ def save_state(path: str, data: Dict[str, Any]) -> None:
         pass  # тихий режим
 
 def tg_send_symbol(sym: str) -> None:
+    """Отправляем только символ. Если неудача — печатаем одну безопасную строку WARN."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("WARN: Telegram env missing (token/chat_id).", flush=True)
         return
+    payload = {"chat_id": CHAT_ID, "text": sym}
     try:
-        requests.post(TG_API, json={"chat_id": CHAT_ID, "text": sym}, timeout=10)
+        r = requests.post(TG_API, json=payload, timeout=10)
+        ok = False
+        try:
+            j = r.json()
+            ok = bool(j.get("ok"))
+            if (not ok) and "error_code" in j:
+                print(f"WARN: Telegram send failed ({j.get('error_code')} {j.get('description','')})", flush=True)
+        except Exception:
+            if r.status_code != 200:
+                print(f"WARN: Telegram send failed (HTTP {r.status_code})", flush=True)
+        if not ok and r.status_code == 403:
+            print("WARN: Telegram 403 (bot blocked / chat_id wrong / no access).", flush=True)
     except Exception:
-        pass  # тихий режим
+        print("WARN: Telegram request exception.", flush=True)
 
 def http_get(path: str, params: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
     url = f"{BINGX_BASE}{path}"
@@ -73,9 +87,8 @@ def http_get(path: str, params: Dict[str, Any], timeout: int = 15) -> Dict[str, 
     r.raise_for_status()
     return r.json()
 
-# ===================== SYMBOL MAP (safety) =====================
+# ===================== SYMBOL MAP =====================
 def to_bingx(sym: str) -> str:
-    """Подстраховка: конвертирует старые форматы в BingX-вид."""
     s = str(sym).strip().upper()
     map_special = {
         "SPXUSDT": "US500-USDT", "NAS100USDT": "US100-USDT", "US30USDT": "US30-USDT",
@@ -83,23 +96,21 @@ def to_bingx(sym: str) -> str:
     }
     if s in map_special: return map_special[s]
     fx = {"EURUSD","GBPUSD","AUDUSD","NZDUSD","USDJPY","USDCHF","USDCAD","USDCNH","USDHKD","USDTRY","USDMXN","USDZAR"}
-    if s in fx: return s[:3] + "-" + s[3:]  # EUR-USD
+    if s in fx: return s[:3] + "-" + s[3:]
     if s.endswith("USDT") and "-" not in s: return s[:-4] + "-USDT"
     return s
 
-# ===================== TICKERS SOURCE (auto from BingX) =====================
+# ===================== TICKERS =====================
 _STOCK_HINTS = {"AAPL-","AMZN-","MSFT-","NVDA-","META-","TSLA-","GOOG-","GOOGL-","NFLX-","AMD-","INTC-","SNOW-","SHOP-","BABA-","COIN-"}
 
 def _parse_contract_symbol(raw: Any) -> str:
     return str(raw).strip().upper()
 
 def load_tickers() -> List[str]:
-    """Берём ВСЕ PERP-контракты и фильтруем: индексы + форекс + xStock + металлы + вся крипта."""
     try:
         data = http_get(CONTRACTS_EP, params={})
     except Exception:
         return DEFAULT_TICKERS[:]
-
     rows = None
     for key in ("data", "result", "contracts", "symbols"):
         v = data.get(key)
@@ -110,29 +121,23 @@ def load_tickers() -> List[str]:
         rows = data
     if not rows:
         return DEFAULT_TICKERS[:]
-
     want: List[str] = []
     for it in rows:
         sym = _parse_contract_symbol(it.get("symbol") or it.get("contractSymbol") or it.get("name") or "")
-        if not sym:
-            continue
+        if not sym: continue
         cat = str(it.get("category") or it.get("contractType") or "").lower()
-
         is_index = ("index" in cat) or any(k in sym for k in ["US100-","US500-","US30-","US2000-","VIX-"])
-        is_fx    = ("forex" in cat) or (sym.count("-") == 1 and all(part.isalpha() for part in sym.split("-")) and len(sym) in (7,8))
+        is_fx    = ("forex" in cat) or (sym.count("-")==1 and all(part.isalpha() for part in sym.split("-")) and len(sym) in (7,8))
         is_metal = sym in {"XAU-USDT","XAG-USDT"}
         is_stock = ("xstock" in cat) or ("stock" in cat) or any(h in sym for h in _STOCK_HINTS)
         is_crypto = (sym.endswith("-USDT") and not (is_index or is_fx or is_stock))
-
         if is_index or is_fx or is_stock or is_metal or is_crypto:
             want.append(sym)
-
     want = sorted(set(want))
     return want if want else DEFAULT_TICKERS[:]
 
 # ===================== MARKET =====================
 def get_klines(symbol: str, kline_type: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """/openApi/swap/v3/quote/klines → [{open,high,low,close,start}, ...]"""
     symbol = to_bingx(symbol)
     params = {"symbol": symbol, "klineType": kline_type, "limit": str(limit)}
     try:
@@ -148,7 +153,6 @@ def get_klines(symbol: str, kline_type: str, limit: int = 500) -> List[Dict[str,
                 break
         if rows is None and isinstance(data, list):
             rows = data
-
         bars: List[Dict[str, Any]] = []
         for it in rows or []:
             if isinstance(it, list) and len(it) >= 5:
@@ -190,7 +194,6 @@ def _color(o: float, c: float) -> int:
     return 1 if c > o else (-1 if c < o else 0)
 
 def _engulf(o1: float, c1: float, o2: float, c2: float, bullish: bool) -> bool:
-    # Сравнение ТОЛЬКО по телам свечей (open/close)
     if bullish:
         return (c1 > o1) and (c2 < o2) and (o1 <= c2) and (c1 >= o2)
     else:
@@ -209,11 +212,10 @@ def _consecutive_prior_same_color(kl: List[Dict[str, Any]], target: int, start_i
     return cnt
 
 def engulfing_after_two_or_more(kl: List[Dict[str, Any]], idx: int = -2) -> Tuple[bool, bool]:
-    """Engulfing на последней ЗАКРЫТОЙ свече (idx=-2) и проверка ≥2 подряд противоположных свечей до неё."""
     if len(kl) < 4 or abs(idx) > len(kl) or abs(idx - 1) > len(kl):
         return (False, False)
-    o1, c1 = float(kl[idx]["open"]),  float(kl[idx]["close"])      # текущий (закрытый)
-    o2, c2 = float(kl[idx-1]["open"]), float(kl[idx-1]["close"])   # предыдущий (закрытый)
+    o1, c1 = float(kl[idx]["open"]),  float(kl[idx]["close"])
+    o2, c2 = float(kl[idx-1]["open"]), float(kl[idx-1]["close"])
     bull_ok = _engulf(o1, c1, o2, c2, bullish=True)  and (_consecutive_prior_same_color(kl, target=-1, start_index=idx-1) >= 2)
     bear_ok = _engulf(o1, c1, o2, c2, bullish=False) and (_consecutive_prior_same_color(kl, target= 1, start_index=idx-1) >= 2)
     return (bull_ok, bear_ok)
@@ -230,9 +232,9 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     k4h = get_klines(symbol, KLINE_4H, limit=DEM_LEN + 50)
     k1d = get_klines(symbol, KLINE_1D, limit=DEM_LEN + 50)
     if len(k4h) < DEM_LEN + 2 or len(k1d) < DEM_LEN + 2:
-        return  # тихо пропускаем
+        return
 
-    # DeMarker рассчитываем по закрытым барам (исключаем последний формирующийся)
+    # DeMarker по закрытым барам
     highs_4h = [b["high"] for b in k4h][:-1]
     lows_4h  = [b["low"]  for b in k4h][:-1]
     highs_1d = [b["high"] for b in k1d][:-1]
@@ -242,9 +244,9 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     dem1d = demarker_last(highs_1d, lows_1d, DEM_LEN)
     bothOB, bothOS, oneOB, oneOS = zone_flags(dem4h, dem1d, DEM_OB, DEM_OS)
 
-    # Паттерны считаем ТОЛЬКО на последней ЗАКРЫТОЙ свече
-    c4 = k4h[-2]   # закрытый 4H
-    c1 = k1d[-2]   # закрытый 1D
+    # Паттерны: последняя ЗАКРЫТАЯ свеча
+    c4 = k4h[-2]
+    c1 = k1d[-2]
 
     u4, lw4 = wick25_flags(c4["open"], c4["high"], c4["low"], c4["close"])
     u1, lw1 = wick25_flags(c1["open"], c1["high"], c1["low"], c1["close"])
@@ -263,7 +265,7 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     def maybe_send(sym: str, key: str):
         if state.get(sym) == key:
             return
-        tg_send_symbol(sym)  # ТОЛЬКО символ
+        tg_send_symbol(sym)
         state[sym] = key
 
     if signal_light_plus_candle:
@@ -273,24 +275,19 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     elif signal_one_tf_plus_candle:
         maybe_send(symbol, "1TF+CAN")
 
-# ===================== STARTUP ANNOUNCE (only once) =====================
+# ===================== STARTUP =====================
 def announce_start(tickers: List[str]) -> None:
-    # Ровно три строки, с мгновенным выводом:
     print(f"INFO: Symbols loaded: {len(tickers)}", flush=True)
     if tickers:
         print(f"INFO: Loaded {len(tickers)} symbols for scan.", flush=True)
         print(f"INFO: First symbol checked: {tickers[0]}", flush=True)
 
-# ===================== MAIN LOOP =====================
 def main():
     tickers = load_tickers()
-    announce_start(tickers)  # единственные строки, которые увидишь в логах
-
+    announce_start(tickers)
     if not tickers:
         return
-
     state = load_state(STATE_PATH)
-
     while True:
         t0 = time.time()
         try:
@@ -298,7 +295,7 @@ def main():
                 process_symbol(sym, state)
             save_state(STATE_PATH, state)
         except Exception:
-            pass  # тихо
+            pass
         dt = time.time() - t0
         time.sleep(max(1, POLL_SECONDS - int(dt)))
 
