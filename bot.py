@@ -170,6 +170,7 @@ def demarker_last(highs: List[float], lows: List[float], length: int = 28) -> fl
     dem_max, dem_min = [], []
     for i in range(1, len(highs)):
         dem_max.append(max(highs[i] - highs[i-1], 0.0))
+    for i in range(1, len(lows)):
         dem_min.append(max(lows[i-1] - lows[i], 0.0))
     m = sum(dem_max[-length:]) / length
     n = sum(dem_min[-length:]) / length
@@ -267,11 +268,11 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
 
 # ===================== STARTUP ANNOUNCE (only once) =====================
 def announce_start(tickers: List[str]) -> None:
-    # Требуются ТОЛЬКО три строки без упоминаний чего-либо:
-    print(f"INFO: Symbols loaded: {len(tickers)}")
+    # Ровно три строки, с мгновенным выводом:
+    print(f"INFO: Symbols loaded: {len(tickers)}", flush=True)
     if tickers:
-        print(f"INFO: Loaded {len(tickers)} symbols for scan.")
-        print(f"INFO: First symbol checked: {tickers[0]}")
+        print(f"INFO: Loaded {len(tickers)} symbols for scan.", flush=True)
+        print(f"INFO: First symbol checked: {tickers[0]}", flush=True)
 
 # ===================== MAIN LOOP =====================
 def main():
