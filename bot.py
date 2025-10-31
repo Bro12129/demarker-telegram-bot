@@ -22,12 +22,12 @@ STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 
 # BingX REST (PERP)
 BINGX_BASE     = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
-KLINE_EP       = "/openApi/swap/v3/quote/klines"      # symbol, klineType in {'4h','1D',...}, limit
+KLINE_EP       = "/openApi/swap/v3/quote/klines"      # symbol, klineType in {'4h','1d',...}, limit
 CONTRACTS_EP   = "/openApi/swap/v2/quote/contracts"   # список деривативных контрактов (на будущее)
 
-# Интревалы (не меняем названия — удобно править из ENV при желании)
+# Интервалы (оставляем настраиваемыми из ENV)
 KLINE_4H       = os.getenv("KLINE_4H", "4h")
-KLINE_1D       = os.getenv("KLINE_1D", "1D")
+KLINE_1D       = os.getenv("KLINE_1D", "1d")  # нижний регистр
 
 # --------- ФИКСИРОВАННЫЙ СОСТАВ ТИКЕРОВ (PERP, без spot) ----------
 # Можно переопределить через ENV, если очень нужно:
@@ -95,12 +95,43 @@ def http_get(path: str, params: Dict[str, Any], timeout: int = 15) -> Dict[str, 
     r.raise_for_status()
     return r.json()
 
+# ===================== SYMBOL MAP FOR BINGX =====================
+def to_bingx(sym: str) -> str:
+    """Преобразует твои тикеры из Bybit-формата в BingX-формат"""
+    s = sym.upper()
+
+    # Индексы и металлы — у BingX другие обозначения
+    map_special = {
+        "SPXUSDT":    "US500-USDT",
+        "NAS100USDT": "US100-USDT",
+        "US30USDT":   "US30-USDT",
+        "US2000USDT": "US2000-USDT",
+        "VIXUSDT":    "VIX-USDT",
+        "XAUUSDT":    "XAU-USDT",
+        "XAGUSDT":    "XAG-USDT",
+    }
+    if s in map_special:
+        return map_special[s]
+
+    # Forex: EURUSD -> EUR-USD
+    fx = {"EURUSD","GBPUSD","AUDUSD","NZDUSD","USDJPY","USDCHF","USDCAD",
+          "USDCNH","USDHKD","USDTRY","USDMXN","USDZAR"}
+    if s in fx:
+        return s[:3] + "-" + s[3:]  # EUR-USD
+
+    # Обычные PERP: BTCUSDT -> BTC-USDT
+    if s.endswith("USDT") and "-" not in s:
+        return s[:-4] + "-USDT"
+
+    return s
+
 # ===================== MARKET =====================
 def get_klines(symbol: str, kline_type: str, limit: int = 500) -> List[Dict[str, Any]]:
     """
     BingX candles (PERP): /openApi/swap/v3/quote/klines
     Возвращает ЗАКРЫТЫЕ бары в хронологическом порядке [{open,high,low,close,start}, ...]
     """
+    symbol = to_bingx(symbol)  # <-- ВАЖНО: конвертация формата тикера под BingX
     params = {"symbol": symbol, "klineType": kline_type, "limit": str(limit)}
     try:
         data = http_get(KLINE_EP, params=params)
@@ -135,7 +166,7 @@ def get_klines(symbol: str, kline_type: str, limit: int = 500) -> List[Dict[str,
         return []
 
 # ===================== INDICATORS & PATTERNS =====================
-def demarker_last(highs: List[float], lows: List[float], length: int = 28) -> float:
+def demarker_last(highs: List[float], lows: List[float], length: int = 28) -> float | None:
     if len(highs) < length + 2 or len(lows) < length + 2:
         return None
     dem_max, dem_min = [], []
@@ -190,7 +221,7 @@ def engulfing_after_two_or_more(klines: List[Dict[str, Any]]) -> Tuple[bool, boo
         bear_ok = (_consecutive_prior_same_color(klines, target_color=1,  start_index=-2) >= 2)
     return (bull_ok, bear_ok)
 
-def zone_flags(d4h: float, d1d: float, ob: float, os: float) -> Tuple[bool, bool, bool, bool]:
+def zone_flags(d4h: float | None, d1d: float | None, ob: float, os: float) -> Tuple[bool, bool, bool, bool]:
     both_ob = (d4h is not None and d1d is not None) and (d4h >= ob and d1d >= ob)
     both_os = (d4h is not None and d1d is not None) and (d4h <= os and d1d <= os)
     one_ob  = (d4h is not None and d1d is not None) and ((d4h >= ob) ^ (d1d >= ob))
@@ -234,7 +265,7 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     def maybe_send(sym: str, key: str):
         if state.get(sym) == key:
             return
-        tg_send_symbol(sym)  # ТОЛЬКО символ
+        tg_send_symbol(sym)  # ТОЛЬКО символ (как у тебя реализовано)
         state[sym] = key
 
     # Приоритеты: L+CAN > LIGHT > 1TF+CAN
