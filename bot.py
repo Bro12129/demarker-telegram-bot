@@ -1,5 +1,6 @@
 # bot.py — Quiet mode (only 3 startup lines), BingX PERP scanner
-# Signals: DeMarker-28 (4H & 1D), Wick≥25%, Engulfing after ≥2 opposite candles.
+# Signals: DeMarker-28 (4H & 1D, last CLOSED bar), Wick≥25% (independent),
+#          Engulfing only after ≥2 consecutive opposite-color candles (by bodies).
 # Alerts: only symbol text. Types: LIGHT / L+CAN / 1TF+CAN (dedup in state).
 
 import os, time, json, logging, requests
@@ -207,13 +208,14 @@ def _consecutive_prior_same_color(kl: List[Dict[str, Any]], target: int, start_i
             break
     return cnt
 
-def engulfing_after_two_or_more(kl: List[Dict[str, Any]]) -> Tuple[bool, bool]:
-    if len(kl) < 4:
+def engulfing_after_two_or_more(kl: List[Dict[str, Any]], idx: int = -2) -> Tuple[bool, bool]:
+    """Engulfing на последней ЗАКРЫТОЙ свече (idx=-2) и проверка ≥2 подряд противоположных свечей до неё."""
+    if len(kl) < 4 or abs(idx) > len(kl) or abs(idx - 1) > len(kl):
         return (False, False)
-    o1, c1 = float(kl[-1]["open"]),  float(kl[-1]["close"])
-    o2, c2 = float(kl[-2]["open"]),  float(kl[-2]["close"])
-    bull_ok = _engulf(o1, c1, o2, c2, bullish=True)  and (_consecutive_prior_same_color(kl, target=-1, start_index=-2) >= 2)
-    bear_ok = _engulf(o1, c1, o2, c2, bullish=False) and (_consecutive_prior_same_color(kl, target= 1, start_index=-2) >= 2)
+    o1, c1 = float(kl[idx]["open"]),  float(kl[idx]["close"])      # текущий (закрытый)
+    o2, c2 = float(kl[idx-1]["open"]), float(kl[idx-1]["close"])   # предыдущий (закрытый)
+    bull_ok = _engulf(o1, c1, o2, c2, bullish=True)  and (_consecutive_prior_same_color(kl, target=-1, start_index=idx-1) >= 2)
+    bear_ok = _engulf(o1, c1, o2, c2, bullish=False) and (_consecutive_prior_same_color(kl, target= 1, start_index=idx-1) >= 2)
     return (bull_ok, bear_ok)
 
 def zone_flags(d4h: float | None, d1d: float | None, ob: float, os: float) -> Tuple[bool, bool, bool, bool]:
@@ -230,21 +232,26 @@ def process_symbol(symbol: str, state: Dict[str, Any]) -> None:
     if len(k4h) < DEM_LEN + 2 or len(k1d) < DEM_LEN + 2:
         return  # тихо пропускаем
 
-    def highs(kl): return [b["high"] for b in kl]
-    def lows(kl):  return [b["low"]  for b in kl]
+    # DeMarker рассчитываем по закрытым барам (исключаем последний формирующийся)
+    highs_4h = [b["high"] for b in k4h][:-1]
+    lows_4h  = [b["low"]  for b in k4h][:-1]
+    highs_1d = [b["high"] for b in k1d][:-1]
+    lows_1d  = [b["low"]  for b in k1d][:-1]
 
-    dem4h = demarker_last(highs(k4h), lows(k4h), DEM_LEN)
-    dem1d = demarker_last(highs(k1d), lows(k1d), DEM_LEN)
+    dem4h = demarker_last(highs_4h, lows_4h, DEM_LEN)
+    dem1d = demarker_last(highs_1d, lows_1d, DEM_LEN)
     bothOB, bothOS, oneOB, oneOS = zone_flags(dem4h, dem1d, DEM_OB, DEM_OS)
 
-    o4,h4,l4,c4 = k4h[-1]["open"], k4h[-1]["high"], k4h[-1]["low"], k4h[-1]["close"]
-    o1,h1,l1,c1 = k1d[-1]["open"], k1d[-1]["high"], k1d[-1]["low"], k1d[-1]["close"]
-    u4,lw4 = wick25_flags(o4,h4,l4,c4)
-    u1,lw1 = wick25_flags(o1,h1,l1,c1)
+    # Паттерны считаем ТОЛЬКО на последней ЗАКРЫТОЙ свече
+    c4 = k4h[-2]   # закрытый 4H
+    c1 = k1d[-2]   # закрытый 1D
+
+    u4, lw4 = wick25_flags(c4["open"], c4["high"], c4["low"], c4["close"])
+    u1, lw1 = wick25_flags(c1["open"], c1["high"], c1["low"], c1["close"])
     wick_any = (u4 or lw4 or u1 or lw1)
 
-    bull_eng_4h, bear_eng_4h = engulfing_after_two_or_more(k4h)
-    bull_eng_1d, bear_eng_1d = engulfing_after_two_or_more(k1d)
+    bull_eng_4h, bear_eng_4h = engulfing_after_two_or_more(k4h, idx=-2)
+    bull_eng_1d, bear_eng_1d = engulfing_after_two_or_more(k1d, idx=-2)
     engulf_any = (bull_eng_4h or bear_eng_4h or bull_eng_1d or bear_eng_1d)
 
     candle_pattern = (wick_any or engulf_any)
