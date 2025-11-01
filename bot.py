@@ -18,9 +18,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Диагностика по желанию (по умолчанию ВЫКЛ)
-DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
-DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
+# Диагностика (по умолчанию ВЫКЛ)
+DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"    # детали отправки TG
+DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"  # 1 строка на цикл
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"  # стартовый ping
 
 # ===================== LOGGING (тихий режим) =====================
@@ -50,13 +50,13 @@ def http_post(url: str, data: Dict = None, json_body: Dict = None, timeout: int 
     except Exception:
         return None
 
-# ===================== STATE (дедуп между рестартами) =====================
+# ===================== STATE (дедуп + кэш вселенной) =====================
 def load_state(path: str) -> Dict:
     try:
         with open(path, "r") as f:
             return json.load(f)
     except Exception:
-        return {"sent": {}}
+        return {"sent": {}, "universe": []}
 
 def save_state(path: str, data: Dict) -> None:
     try:
@@ -68,9 +68,9 @@ def save_state(path: str, data: Dict) -> None:
     except Exception:
         pass
 
-STATE = load_state(STATE_PATH)  # {"sent": { "<key>": <ts> }}
+STATE = load_state(STATE_PATH)  # {"sent": {...}, "universe": [...]}
 
-# ===================== STATIC SYMBOLS (fallback) =====================
+# ===================== STATIC SEED (на всякий случай) =====================
 STATIC_SYMBOLS: List[str] = [
     # Крипто (мейджоры)
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
@@ -83,7 +83,7 @@ STATIC_SYMBOLS: List[str] = [
     "EUR-USD","GBP-USD","USD-JPY","AUD-USD","USD-CAD","USD-CHF"
 ]
 
-# ===================== SYMBOLS (BingX + fallback) =====================
+# ===================== SYMBOLS (BingX + кэш + seed) =====================
 def fetch_contracts_dynamic() -> List[str]:
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/contracts"
     data = http_get(url, params={}) or {}
@@ -106,15 +106,20 @@ def fetch_contracts_dynamic() -> List[str]:
             out.append(s); continue
         if s.endswith("-USDT"):                        # крипто к USDT
             out.append(s); continue
-    return out
+    return sorted(set(out))
 
 def get_symbols() -> List[str]:
-    # 1) пробуем динамически с API
     dyn = fetch_contracts_dynamic()
     if dyn:
+        # обновим кэш и вернём объединение с seed
         universe = sorted(set(dyn) | set(STATIC_SYMBOLS))
+        STATE["universe"] = universe
+        save_state(STATE_PATH, STATE)
         return universe
-    # 2) если API пустой — используем статический пул
+    # если API пуст — берём кэш, иначе seed
+    cached = STATE.get("universe") or []
+    if cached:
+        return cached
     return STATIC_SYMBOLS[:]
 
 # ===================== KLINES =====================
@@ -269,12 +274,15 @@ def main_loop():
     symbols = get_symbols()
     if not symbols:
         symbols = ["BTC-USDT"]  # крайний случай
-    # Тихий старт — ровно три строки
+
+    # Тихий старт — РОВНО три строки:
     log.info(f"INFO: Symbols loaded: {len(symbols)}")
     log.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     log.info(f"INFO: First symbol checked: {symbols[0]}")
+
     if SELFTEST_PING:
         tg_send_raw("ping")
+
     while True:
         sent_any = False
         processed = 0
@@ -292,6 +300,7 @@ def main_loop():
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
+    # защита от падений (чтобы не было бесконечных рестартов)
     while True:
         try:
             main_loop()
