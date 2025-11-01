@@ -19,24 +19,22 @@ TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # Диагностика (по умолчанию ВЫКЛ)
-DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"    # детали отправки TG
-DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"  # 1 строка на цикл
-SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"  # стартовый ping
+DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
+DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
+SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"  # стартовый ping вручную
 
 # ===================== LOGGING (тихий режим) =====================
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
 log = logging.getLogger("bot")
 def dprint(msg: str):
-    if DEBUG_TG or DEBUG_SCAN:
-        log.info(msg)
+    if DEBUG_TG or DEBUG_SCAN: log.info(msg)
 
 # ===================== HTTP =====================
 def http_get(url: str, params: Dict[str, str], timeout: int = 15, tries: int = 3, pause: float = 0.4) -> Optional[Dict]:
     for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
+            if r.status_code == 200: return r.json()
         except Exception:
             pass
         time.sleep(pause * (i + 1))
@@ -44,8 +42,7 @@ def http_get(url: str, params: Dict[str, str], timeout: int = 15, tries: int = 3
 
 def http_post(url: str, data: Dict = None, json_body: Dict = None, timeout: int = 10) -> Optional[requests.Response]:
     try:
-        if json_body is not None:
-            return requests.post(url, json=json_body, timeout=timeout)
+        if json_body is not None: return requests.post(url, json=json_body, timeout=timeout)
         return requests.post(url, data=data, timeout=timeout)
     except Exception:
         return None
@@ -53,8 +50,7 @@ def http_post(url: str, data: Dict = None, json_body: Dict = None, timeout: int 
 # ===================== STATE (дедуп + кэш вселенной) =====================
 def load_state(path: str) -> Dict:
     try:
-        with open(path, "r") as f:
-            return json.load(f)
+        with open(path, "r") as f: return json.load(f)
     except Exception:
         return {"sent": {}, "universe": []}
 
@@ -62,24 +58,18 @@ def save_state(path: str, data: Dict) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
+        with open(tmp, "w") as f: json.dump(data, f)
         os.replace(tmp, path)
     except Exception:
         pass
 
 STATE = load_state(STATE_PATH)  # {"sent": {...}, "universe": [...]}
 
-# ===================== STATIC SEED (на всякий случай) =====================
+# ===================== STATIC SEED (если API молчит) =====================
 STATIC_SYMBOLS: List[str] = [
-    # Крипто (мейджоры)
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
     "TON-USDT","LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT",
-    # Металлы
-    "XAU-USDT","XAG-USDT",
-    # Индексы США и волатильность
-    "US100","US500","US30","US2000","VIX",
-    # FX
+    "XAU-USDT","XAG-USDT","US100","US500","US30","US2000","VIX",
     "EUR-USD","GBP-USD","USD-JPY","AUD-USD","USD-CAD","USD-CHF"
 ]
 
@@ -91,52 +81,40 @@ def fetch_contracts_dynamic() -> List[str]:
     out: List[str] = []
     for it in items:
         sym = (it.get("symbol") or it.get("contractId") or "").upper()
-        if not sym:
-            continue
+        if not sym: continue
         ctype = (it.get("contractType") or it.get("type") or "").upper()
-        if "PERP" not in ctype:
-            continue
+        if "PERP" not in ctype: continue
         cat = (it.get("category") or it.get("assetType") or "").lower()
         s = sym.upper()
-        if s in {"US100","US500","US30","US2000","VIX","XAU-USDT","XAG-USDT"}:
-            out.append(s); continue
-        if "stock" in cat or "xstock" in cat:
-            out.append(s); continue
-        if "-" in s and len(s) == 7 and s[3] == "-":   # FX: EUR-USD
-            out.append(s); continue
-        if s.endswith("-USDT"):                        # крипто к USDT
-            out.append(s); continue
+        if s in {"US100","US500","US30","US2000","VIX","XAU-USDT","XAG-USDT"}: out.append(s); continue
+        if "stock" in cat or "xstock" in cat: out.append(s); continue
+        if "-" in s and len(s) == 7 and s[3] == "-": out.append(s); continue  # FX: EUR-USD
+        if s.endswith("-USDT"): out.append(s); continue                         # crypto-USDT
     return sorted(set(out))
 
 def get_symbols() -> List[str]:
     dyn = fetch_contracts_dynamic()
     if dyn:
-        # обновим кэш и вернём объединение с seed
         universe = sorted(set(dyn) | set(STATIC_SYMBOLS))
         STATE["universe"] = universe
         save_state(STATE_PATH, STATE)
         return universe
-    # если API пуст — берём кэш, иначе seed
     cached = STATE.get("universe") or []
-    if cached:
-        return cached
-    return STATIC_SYMBOLS[:]
+    return cached if cached else STATIC_SYMBOLS[:]
 
 # ===================== KLINES =====================
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
     url = f"{BINGX_BASE}/openApi/swap/v3/quote/klines"
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
     data = http_get(url, params=params)
-    if not data:
-        return None
+    if not data: return None
     raw = data.get("data") or data.get("klines") or []
     out: List[List[float]] = []
     for k in raw:
         if isinstance(k, dict):
             try:
                 t = int(k.get("openTime") or k.get("time") or k.get("t"))
-                o = float(k.get("open")); h = float(k.get("high"))
-                l = float(k.get("low"));  c = float(k.get("close"))
+                o = float(k.get("open")); h = float(k.get("high")); l = float(k.get("low")); c = float(k.get("close"))
             except Exception:
                 continue
         else:
@@ -144,16 +122,14 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
                 t = int(k[0]); o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
             except Exception:
                 continue
-        if h <= 0 or l <= 0:
-            continue
+        if h <= 0 or l <= 0: continue
         out.append([t,o,h,l,c])
     out.sort(key=lambda x: x[0])
     return out or None
 
 # ===================== INDICATORS =====================
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
-    if not ohlc or len(ohlc) < length + 2:
-        return None
+    if not ohlc or len(ohlc) < length + 2: return None
     highs = [x[2] for x in ohlc]; lows  = [x[3] for x in ohlc]
     up = [0.0]; dn = [0.0]
     for i in range(1, len(ohlc)):
@@ -204,23 +180,32 @@ def zone_of(v: Optional[float]) -> Optional[str]:
     return None
 
 def classify_signal(dem4h: Optional[float], dem1d: Optional[float], has_candle: bool) -> Optional[Tuple[str, Optional[str]]]:
-    z4 = zone_of(dem4h); z1 = zone_of(dem1d)
+    """
+    Возвращает (тип, зона) согласно требованиям:
+      - LIGHT   : обе DeM в одной зоне, паттерна нет
+      - L+CAN   : обе DeM в одной зоне, паттерн есть
+      - 1TF+CAN : ровно одна DeM в зоне, паттерн есть
+      - None    : иначе (не шлём)
+    """
+    z4 = zone_of(dem4h)
+    z1 = zone_of(dem1d)
     both = (z4 is not None) and (z1 is not None) and (z4 == z1)
     one  = ((z4 is not None) ^ (z1 is not None))
-    if both and has_candle:     return ("L+CAN", z4)
-    if both and not has_candle: return ("LIGHT", z4)
-    if one and has_candle:      return ("1TF+CAN", z4 or z1)
-    return None
+
+    if both and has_candle:     return ("L+CAN", z4)   # стрелка + ⚡🕯️
+    if both and not has_candle: return ("LIGHT", z4)   # стрелка + ⚡
+    if one and has_candle:      return ("1TF+CAN", z4 or z1)  # стрелка + 🕯️
+    return None  # чистый паттерн или один DeM без паттерна — не шлём
 
 # ===================== TELEGRAM =====================
 def tg_send_raw(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         dprint("TG: пустые токен/чат."); return False
     url = f"{TG_API}/sendMessage"
-    payload_form = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
-    payload_json = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
+    form = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
+    jsn  = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
     for attempt in range(1, 4):
-        r = http_post(url, data=payload_form)
+        r = http_post(url, data=form)
         ok = False
         if r is not None:
             try: ok = (r.status_code == 200) and (r.json().get("ok") is True)
@@ -228,7 +213,7 @@ def tg_send_raw(text: str) -> bool:
         dprint(f"TG attempt {attempt} form: code={getattr(r,'status_code',None)} ok={ok}")
         if ok: return True
         time.sleep(0.4 * attempt)
-        r = http_post(url, json_body=payload_json)
+        r = http_post(url, json_body=jsn)
         ok = False
         if r is not None:
             try: ok = (r.status_code == 200) and (r.json().get("ok") is True)
@@ -238,8 +223,15 @@ def tg_send_raw(text: str) -> bool:
         time.sleep(0.4 * attempt)
     return False
 
-def tg_send_symbol_only(symbol: str) -> bool:
-    return tg_send_raw(symbol)
+def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> str:
+    arrow = "🔻" if zone == "OB" else ("🔺" if zone == "OS" else "")
+    if signal_type == "LIGHT":      status = "⚡"
+    elif signal_type == "L+CAN":    status = "⚡🕯️"
+    else:                           status = "🕯️"  # 1TF+CAN
+    return f"{symbol} {arrow}{status}"
+
+def tg_send_signal(symbol: str, signal_type: str, zone: Optional[str]) -> bool:
+    return tg_send_raw(format_signal_text(symbol, signal_type, zone))
 
 # ===================== CORE =====================
 def last_value(series: List[Optional[float]]) -> Optional[float]:
@@ -251,37 +243,39 @@ def build_dedup_key(symbol: str, signal_type: str, zone: Optional[str], last_ts:
 def process_symbol(symbol: str) -> Optional[str]:
     k4 = fetch_klines(symbol, KLINE_4H, limit=max(200, DEM_LEN + 10))
     k1 = fetch_klines(symbol, KLINE_1D, limit=max(200, DEM_LEN + 10))
-    if not k4 or not k1:
-        return None
+    if not k4 or not k1: return None
+
     dem4_series = demarker_series(k4, DEM_LEN)
     dem1_series = demarker_series(k1, DEM_LEN)
-    if not dem4_series or not dem1_series:
-        return None
-    dem4 = last_value(dem4_series); dem1 = last_value(dem1_series)
+    if not dem4_series or not dem1_series: return None
+
+    dem4 = last_value(dem4_series)
+    dem1 = last_value(dem1_series)
     has_candle = candle_pattern_ok(k4)
+
     cls = classify_signal(dem4, dem1, has_candle)
-    if not cls: return None
+    if not cls: return None  # здесь отсекаются «невалидные» случаи
+
     sig_type, zone = cls
     last_ts_1d = k1[-1][0]
     key = build_dedup_key(symbol, sig_type, zone, last_ts_1d)
     if STATE["sent"].get(key): return None
-    if tg_send_symbol_only(symbol):
+
+    if tg_send_signal(symbol, sig_type, zone):
         STATE["sent"][key] = int(time.time())
         return symbol
     return None
 
 def main_loop():
     symbols = get_symbols()
-    if not symbols:
-        symbols = ["BTC-USDT"]  # крайний случай
+    if not symbols: symbols = ["BTC-USDT"]  # крайний случай
 
     # Тихий старт — РОВНО три строки:
     log.info(f"INFO: Symbols loaded: {len(symbols)}")
     log.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     log.info(f"INFO: First symbol checked: {symbols[0]}")
 
-    if SELFTEST_PING:
-        tg_send_raw("ping")
+    if SELFTEST_PING: tg_send_raw("ping")
 
     while True:
         sent_any = False
@@ -289,18 +283,15 @@ def main_loop():
         for sym in symbols:
             try:
                 processed += 1
-                if process_symbol(sym):
-                    sent_any = True
+                if process_symbol(sym): sent_any = True
             except Exception:
                 pass
-        if sent_any:
-            save_state(STATE_PATH, STATE)
-        if DEBUG_SCAN:
-            dprint(f"SCAN: processed={processed} sent={'1+' if sent_any else '0'}")
+        if sent_any: save_state(STATE_PATH, STATE)
+        if DEBUG_SCAN: dprint(f"SCAN: processed={processed} sent={'1+' if sent_any else '0'}")
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
-    # защита от падений (чтобы не было бесконечных рестартов)
+    # защита от падений
     while True:
         try:
             main_loop()
