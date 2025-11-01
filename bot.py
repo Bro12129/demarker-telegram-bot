@@ -22,8 +22,8 @@ DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
 DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
-# Новое: версия формата (для обхода дедупа при смене эмодзи)
-FORMAT_VER     = os.getenv("FORMAT_VER", "v1")
+# Версия формата для обхода дедупа при смене эмодзи/логики
+FORMAT_VER     = os.getenv("FORMAT_VER", "v3")
 
 # ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
@@ -72,7 +72,7 @@ def save_state(path: str, data: Dict) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ SEED ============
+# ============ SEED (на случай, если API не даст список) ============
 STATIC_SYMBOLS: List[str] = [
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
     "TON-USDT","LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT",
@@ -88,15 +88,21 @@ def fetch_contracts_dynamic() -> List[str]:
     out: List[str] = []
     for it in items:
         sym = (it.get("symbol") or it.get("contractId") or "").upper()
-        if not sym: continue
+        if not sym:
+            continue
         ctype = (it.get("contractType") or it.get("type") or "").upper()
-        if "PERP" not in ctype: continue
+        if "PERP" not in ctype:
+            continue
         cat = (it.get("category") or it.get("assetType") or "").lower()
         s = sym.upper()
-        if s in {"US100","US500","US30","US2000","VIX","XAU-USDT","XAG-USDT"}: out.append(s); continue
-        if "stock" in cat or "xstock" in cat: out.append(s); continue
-        if "-" in s and len(s) == 7 and s[3] == "-": out.append(s); continue  # FX
-        if s.endswith("-USDT"): out.append(s); continue                       # crypto
+        if s in {"US100","US500","US30","US2000","VIX","XAU-USDT","XAG-USDT"}:
+            out.append(s); continue
+        if "stock" in cat or "xstock" in cat:
+            out.append(s); continue
+        if "-" in s and len(s) == 7 and s[3] == "-":   # FX
+            out.append(s); continue
+        if s.endswith("-USDT"):                        # crypto
+            out.append(s); continue
     return sorted(set(out))
 
 def get_symbols() -> List[str]:
@@ -114,7 +120,8 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
     url = f"{BINGX_BASE}/openApi/swap/v3/quote/klines"
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
     data = http_get(url, params=params)
-    if not data: return None
+    if not data:
+        return None
     raw = data.get("data") or data.get("klines") or []
     out: List[List[float]] = []
     for k in raw:
@@ -129,15 +136,17 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
                 t = int(k[0]); o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
             except Exception:
                 continue
-        if h <= 0 or l <= 0: continue
+        if h <= 0 or l <= 0:
+            continue
         out.append([t,o,h,l,c])
     out.sort(key=lambda x: x[0])
     return out or None
 
 # ============ INDICATORS ============
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
-    if not ohlc or len(ohlc) < length + 2: return None
-    highs = [x[2] for x in ohlc]; lows = [x[3] for x in ohlc]
+    if not ohlc or len(ohlc) < length + 2:
+        return None
+    highs = [x[2] for x in ohlc]; lows  = [x[3] for x in ohlc]
     up = [0.0]; dn = [0.0]
     for i in range(1, len(ohlc)):
         up.append(max(highs[i]-highs[i-1], 0.0))
@@ -153,22 +162,28 @@ def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optio
         dem[i] = (up_s/denom) if denom != 0 else 0.5
     return dem
 
-# ============ CANDLE PATTERNS ============
-def wick_ge_25pct(o: float, h: float, l: float, c: float) -> bool:
+# ============ CANDLE PATTERNS (ТОЛЬКО ЗАКРЫТАЯ СВЕЧА) ============
+def wick_ge_25pct_at(ohlc: List[List[float]], idx: int) -> bool:
+    if len(ohlc) < (-idx) or len(ohlc) < 2:  # достаточно данных?
+        return False
+    o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
     rng = max(h-l, 1e-12)
     upper = h - max(o,c)
     lower = min(o,c) - l
     return (upper >= 0.25*rng) or (lower >= 0.25*rng)
 
-def is_bull(c: float, o: float) -> bool:
-    return c >= o
-
-def engulfing_with_prior_opposition(ohlc: List[List[float]]) -> bool:
-    if len(ohlc) < 4: return False
-    o0,h0,l0,c0 = ohlc[-1][1], ohlc[-1][2], ohlc[-1][3], ohlc[-1][4]
-    o1,h1,l1,c1 = ohlc[-2][1], ohlc[-2][2], ohlc[-2][3], ohlc[-2][4]
-    o2,c2 = ohlc[-3][1], ohlc[-3][4]; o3,c3 = ohlc[-4][1], ohlc[-4][4]
-    bull0 = is_bull(c0,o0); bull2 = is_bull(c2,o2); bull3 = is_bull(c3,o3)
+def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
+    # Базовая (engulf) = закрытая свеча base_idx (обычно -2)
+    need = (-base_idx) + 3  # base, prev1, prev2, prev3
+    if len(ohlc) < need:
+        return False
+    o0,h0,l0,c0 = ohlc[base_idx][1], ohlc[base_idx][2], ohlc[base_idx][3], ohlc[base_idx][4]
+    o1,h1,l1,c1 = ohlc[base_idx-1][1], ohlc[base_idx-1][2], ohlc[base_idx-1][3], ohlc[base_idx-1][4]
+    o2,c2 = ohlc[base_idx-2][1], ohlc[base_idx-2][4]
+    o3,c3 = ohlc[base_idx-3][1], ohlc[base_idx-3][4]
+    bull0 = c0 >= o0
+    bull2 = c2 >= o2
+    bull3 = c3 >= o3
     if bull0:
         if not ((not bull2) and (not bull3)): return False
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
@@ -176,34 +191,32 @@ def engulfing_with_prior_opposition(ohlc: List[List[float]]) -> bool:
         if not (bull2 and bull3): return False
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
-def candle_pattern_ok(ohlc: List[List[float]]) -> bool:
-    o,h,l,c = ohlc[-1][1], ohlc[-1][2], ohlc[-1][3], ohlc[-1][4]
-    return wick_ge_25pct(o,h,l,c) or engulfing_with_prior_opposition(ohlc)
+def candle_pattern_ok_closed(ohlc: List[List[float]]) -> bool:
+    # Ищем только на последней ЗАКРЫТОЙ свече (index = -2)
+    if not ohlc or len(ohlc) < 3:
+        return False
+    base_idx = -2
+    return wick_ge_25pct_at(ohlc, base_idx) or engulfing_with_prior_opposition_at(ohlc, base_idx)
 
-# ============ SIGNAL LOGIC ============
+# ============ SIGNAL UTILS ============
 def zone_of(v: Optional[float]) -> Optional[str]:
     if v is None: return None
     if v >= DEM_OB: return "OB"
     if v <= DEM_OS: return "OS"
     return None
 
-def classify_signal(dem4h: Optional[float], dem1d: Optional[float], has_candle: bool) -> Optional[Tuple[str, Optional[str]]]:
-    z4 = zone_of(dem4h); z1 = zone_of(dem1d)
-    both = (z4 is not None) and (z1 is not None) and (z4 == z1)
-    one  = ((z4 is not None) ^ (z1 is not None))
-    if both and has_candle:     return ("L+CAN", z4)
-    if both and not has_candle: return ("LIGHT", z4)
-    if one and has_candle:      return ("1TF+CAN", z4 or z1)
-    return None
+def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> str:
+    arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
+    status = "⚡" if signal_type == "LIGHT" else ("⚡🕯️" if signal_type == "L+CAN" else "🕯️")
+    return f"{symbol} {arrow} {status}".strip()
 
-# ============ TELEGRAM ============
 def tg_send_raw(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        dprint("TG: empty token/chat"); return False
+        dprint("TG: пустые токен/чат."); return False
     url = f"{TG_API}/sendMessage"
     form = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
     jsn  = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
-    for attempt in range(1, 3+1):
+    for attempt in range(1, 4):
         r = http_post(url, data=form)
         ok = False
         if r is not None:
@@ -220,12 +233,6 @@ def tg_send_raw(text: str) -> bool:
         time.sleep(0.4 * attempt)
     return False
 
-# ==== НОВОЕ форматирование: OS -> 🟢↑, OB -> 🔴↓
-def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> str:
-    arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
-    status = "⚡" if signal_type == "LIGHT" else ("⚡🕯️" if signal_type == "L+CAN" else "🕯️")
-    return f"{symbol} {arrow} {status}".strip()
-
 def tg_send_signal(symbol: str, signal_type: str, zone: Optional[str]) -> bool:
     return tg_send_raw(format_signal_text(symbol, signal_type, zone))
 
@@ -234,44 +241,72 @@ def last_value(series: List[Optional[float]]) -> Optional[float]:
     return series[-1] if series else None
 
 def build_dedup_key(symbol: str, signal_type: str, zone: Optional[str], last_ts: int) -> str:
-    # Добавили FORMAT_VER, чтобы новая версия эмодзи не блокировалась старым дедупом
+    # Включаем версию формата в ключ, чтобы новые правила не блокировались старым state.json
     return f"{FORMAT_VER}|{symbol}|{signal_type}|{zone or '-'}|{last_ts}"
 
 def process_symbol(symbol: str) -> Optional[str]:
     k4 = fetch_klines(symbol, KLINE_4H, limit=max(200, DEM_LEN + 10))
     k1 = fetch_klines(symbol, KLINE_1D, limit=max(200, DEM_LEN + 10))
-    if not k4 or not k1: return None
+    if not k4 or not k1:
+        return None
 
     dem4_series = demarker_series(k4, DEM_LEN)
     dem1_series = demarker_series(k1, DEM_LEN)
-    if not dem4_series or not dem1_series: return None
+    if not dem4_series or not dem1_series:
+        return None
 
-    dem4 = last_value(dem4_series); dem1 = last_value(dem1_series)
-    has_candle = candle_pattern_ok(k4)
+    dem4 = last_value(dem4_series)
+    dem1 = last_value(dem1_series)
 
-    cls = classify_signal(dem4, dem1, has_candle)
-    if not cls: return None
+    # Зоны по каждому ТФ
+    z4 = zone_of(dem4)   # "OB" / "OS" / None
+    z1 = zone_of(dem1)
 
-    sig_type, zone = cls
-    last_ts_1d = k1[-1][0]
-    key = build_dedup_key(symbol, sig_type, zone, last_ts_1d)
-    if STATE["sent"].get(key): return None
+    # Свечной паттерн считаем ТОЛЬКО на тех ТФ, где есть зона
+    has_can_4 = candle_pattern_ok_closed(k4) if z4 is not None else False
+    has_can_1 = candle_pattern_ok_closed(k1) if z1 is not None else False
 
-    if tg_send_signal(symbol, sig_type, zone):
+    # Классификация строго по правилам
+    sig_type: Optional[str] = None
+    zone_for_msg: Optional[str] = None
+
+    if (z4 is not None) and (z1 is not None) and (z4 == z1):
+        # обе DeM в одной зоне
+        sig_type = "L+CAN" if (has_can_4 or has_can_1) else "LIGHT"
+        zone_for_msg = z4
+    elif (z4 is not None) ^ (z1 is not None):
+        # только один ТФ в зоне, нужен паттерн на ЭТОМ ТФ
+        if z4 is not None and has_can_4:
+            sig_type = "1TF+CAN"; zone_for_msg = z4
+        elif z1 is not None and has_can_1:
+            sig_type = "1TF+CAN"; zone_for_msg = z1
+        else:
+            return None
+    else:
+        return None
+
+    last_ts_1d = k1[-1][0]  # дедуп к текущему дневному бару
+    key = build_dedup_key(symbol, sig_type, zone_for_msg, last_ts_1d)
+    if STATE["sent"].get(key):
+        return None
+
+    if tg_send_signal(symbol, sig_type, zone_for_msg):
         STATE["sent"][key] = int(time.time())
         return symbol
     return None
 
 def main_loop():
     symbols = get_symbols()
-    if not symbols: symbols = ["BTC-USDT"]
+    if not symbols:
+        symbols = ["BTC-USDT"]
 
+    # Тихий старт — три строки
     logging.info(f"INFO: Symbols loaded: {len(symbols)}")
     logging.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     logging.info(f"INFO: First symbol checked: {symbols[0]}")
 
     if SELFTEST_PING:
-        tg_send_raw("🟢↑⚡🕯️")
+        tg_send_raw("🟢↑⚡🕯️")  # тест-формат один раз
 
     while True:
         sent_any = False
