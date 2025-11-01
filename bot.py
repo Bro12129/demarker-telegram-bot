@@ -18,6 +18,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# >>> ADD: чат группы для публикации сигналов <<<
+GROUP_CHAT_ID  = "-1002963303214"  # приватная группа для сигналов
+
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
 DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
@@ -211,27 +214,37 @@ def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> st
     return f"{symbol} {arrow} {status}".strip()
 
 def tg_send_raw(text: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        dprint("TG: пустые токен/чат."); return False
+    if not TELEGRAM_TOKEN:
+        dprint("TG: пустой токен."); return False
+
     url = f"{TG_API}/sendMessage"
-    form = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
-    jsn  = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
-    for attempt in range(1, 4):
+    ok_any = False
+
+    # отправляем в BOT_CHAT (если задан), затем всегда в GROUP_CHAT_ID
+    recipients = []
+    if TELEGRAM_CHAT:
+        recipients.append(TELEGRAM_CHAT)
+    recipients.append(GROUP_CHAT_ID)
+
+    for chat_id in recipients:
+        # два варианта (form/json) с повторами — как у тебя было
+        form = {"chat_id": chat_id, "text": text, "disable_notification": True}
+        jsn  = {"chat_id": chat_id, "text": text, "disable_notification": True}
+        delivered = False
         r = http_post(url, data=form)
-        ok = False
         if r is not None:
-            try: ok = (r.status_code == 200) and (r.json().get("ok") is True)
-            except Exception: ok = False
-        if ok: return True
-        time.sleep(0.4 * attempt)
-        r = http_post(url, json_body=jsn)
-        ok = False
-        if r is not None:
-            try: ok = (r.status_code == 200) and (r.json().get("ok") is True)
-            except Exception: ok = False
-        if ok: return True
-        time.sleep(0.4 * attempt)
-    return False
+            try: delivered = (r.status_code == 200) and (r.json().get("ok") is True)
+            except Exception: delivered = False
+        if not delivered:
+            r = http_post(url, json_body=jsn)
+            if r is not None:
+                try: delivered = (r.status_code == 200) and (r.json().get("ok") is True)
+                except Exception: delivered = False
+        ok_any = ok_any or delivered
+        # небольшая пауза между получателями
+        time.sleep(0.05)
+
+    return ok_any
 
 def tg_send_signal(symbol: str, signal_type: str, zone: Optional[str]) -> bool:
     return tg_send_raw(format_signal_text(symbol, signal_type, zone))
