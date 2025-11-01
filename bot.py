@@ -22,26 +22,30 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Вкл. точечную диагностику отправки TG (по умолчанию выкл., менять не нужно)
-DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
+# Диагностика (по умолчанию ВЫКЛ)
+DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"    # детальки отправки в TG (HTTP-коды)
+DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"  # итог цикла: сколько обработано/отправлено
+SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"  # стартовый ping (по умолчанию выкл)
 
 # ===================== LOGGING (тихий режим) =====================
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
 log = logging.getLogger("bot")
 
 def dprint(msg: str):
-    if DEBUG_TG:
+    if DEBUG_TG or DEBUG_SCAN:
         log.info(msg)
 
 # ===================== HTTP =====================
-def http_get(url: str, params: Dict[str, str], timeout: int = 15) -> Optional[Dict]:
-    try:
-        r = requests.get(url, params=params, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except Exception:
-        return None
+def http_get(url: str, params: Dict[str, str], timeout: int = 15, tries: int = 3, pause: float = 0.4) -> Optional[Dict]:
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        time.sleep(pause * (i + 1))
+    return None
 
 def http_post(url: str, data: Dict = None, json_body: Dict = None, timeout: int = 10) -> Optional[requests.Response]:
     try:
@@ -90,9 +94,9 @@ def fetch_contracts() -> List[str]:
             out.append(s); continue
         if "stock" in cat or "xstock" in cat:
             out.append(s); continue
-        if "-" in s and len(s) == 7 and s[3] == "-":   # FX, типа EUR-USD
+        if "-" in s and len(s) == 7 and s[3] == "-":   # FX: EUR-USD
             out.append(s); continue
-        if s.endswith("-USDT"):                        # крипто к USDT
+        if s.endswith("-USDT"):                        # кріпто к USDT
             out.append(s); continue
     return sorted(set(out))
 
@@ -122,7 +126,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
             continue
         out.append([t,o,h,l,c])
     out.sort(key=lambda x: x[0])
-    return out
+    return out or None
 
 # ===================== INDICATORS =====================
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
@@ -163,17 +167,13 @@ def engulfing_with_prior_opposition(ohlc: List[List[float]]) -> bool:
     o1,h1,l1,c1 = ohlc[-2][1], ohlc[-2][2], ohlc[-2][3], ohlc[-2][4]
     o2,c2 = ohlc[-3][1], ohlc[-3][4]
     o3,c3 = ohlc[-4][1], ohlc[-4][4]
-    bull0 = is_bull(c0,o0); bull1 = is_bull(c1,o1); bull2 = is_bull(c2,o2); bull3 = is_bull(c3,o3)
-    if bull0:
+    bull0 = is_bull(c0,o0); bull2 = is_bull(c2,o2); bull3 = is_bull(c3,o3)
+    if is_bull(c0,o0):
         if not ((not bull2) and (not bull3)): return False
-        body0_min, body0_max = min(o0,c0), max(o0,c0)
-        body1_min, body1_max = min(o1,c1), max(o1,c1)
-        return (body0_min <= body1_min) and (body0_max >= body1_max)
+        return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
     else:
         if not (bull2 and bull3): return False
-        body0_min, body0_max = min(o0,c0), max(o0,c0)
-        body1_min, body1_max = min(o1,c1), max(o1,c1)
-        return (body0_min <= body1_min) and (body0_max >= body1_max)
+        return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
 def candle_pattern_ok(ohlc: List[List[float]]) -> bool:
     o,h,l,c = ohlc[-1][1], ohlc[-1][2], ohlc[-1][3], ohlc[-1][4]
@@ -195,41 +195,37 @@ def classify_signal(dem4h: Optional[float], dem1d: Optional[float], has_candle: 
     if one and has_candle:      return ("1TF+CAN", z4 or z1)
     return None
 
-# ===================== TELEGRAM (усилено) =====================
+# ===================== TELEGRAM =====================
 def tg_send_raw(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         dprint("TG: пустые токен/чат.")
         return False
-
     url = f"{TG_API}/sendMessage"
     payload_form = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
     payload_json = {"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True}
-
-    for attempt in range(1, 4):
-        # 1) form-data
+    # до 3 попыток: form-data -> json
+    for attempt in range(1, 3+1):
         r = http_post(url, data=payload_form)
+        ok = False
         if r is not None:
             try:
                 ok = (r.status_code == 200) and (r.json().get("ok") is True)
             except Exception:
                 ok = False
-            dprint(f"TG attempt {attempt} form: code={getattr(r,'status_code',None)} ok={ok}")
-            if ok:
-                return True
-        time.sleep(0.5 * attempt)
+        dprint(f"TG attempt {attempt} form: code={getattr(r,'status_code',None)} ok={ok}")
+        if ok: return True
+        time.sleep(0.4 * attempt)
 
-        # 2) json
         r = http_post(url, json_body=payload_json)
+        ok = False
         if r is not None:
             try:
                 ok = (r.status_code == 200) and (r.json().get("ok") is True)
             except Exception:
                 ok = False
-            dprint(f"TG attempt {attempt} json: code={getattr(r,'status_code',None)} ok={ok}")
-            if ok:
-                return True
-        time.sleep(0.5 * attempt)
-
+        dprint(f"TG attempt {attempt} json: code={getattr(r,'status_code',None)} ok={ok}")
+        if ok: return True
+        time.sleep(0.4 * attempt)
     return False
 
 def tg_send_symbol_only(symbol: str) -> bool:
@@ -272,11 +268,7 @@ def process_symbol(symbol: str) -> Optional[str]:
         return symbol
     return None
 
-def startup_selftest():
-    # Одноразовый ping при старте — чтобы сразу увидеть связь с Telegram
-    tg_send_raw("ping")
-
-def main():
+def main_loop():
     symbols = fetch_contracts()
     if not symbols:
         symbols = ["BTC-USDT"]  # fallback
@@ -286,20 +278,35 @@ def main():
     log.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     log.info(f"INFO: First symbol checked: {symbols[0]}")
 
-    # Одноразовый self-test в Telegram (не раскрывает стратегию)
-    startup_selftest()
+    # Стартовый ping ТОЛЬКО если явно включен
+    if SELFTEST_PING:
+        tg_send_raw("ping")
 
     while True:
         sent_any = False
+        processed = 0
         for sym in symbols:
             try:
+                processed += 1
                 if process_symbol(sym):
                     sent_any = True
             except Exception:
+                # не шумим
                 pass
         if sent_any:
             save_state(STATE_PATH, STATE)
+
+        if DEBUG_SCAN:
+            # 1 строка на цикл, без деталей стратегии
+            dprint(f"SCAN: processed={processed} sent={'1+' if sent_any else '0'}")
+
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
-    main()
+    # Страховка от падений: бесконечный наружный цикл
+    while True:
+        try:
+            main_loop()
+        except Exception:
+            # краткая пауза и повтор, чтобы не улетать в рестарты Render
+            time.sleep(2)
