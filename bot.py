@@ -8,8 +8,8 @@ KLINE_4H       = os.getenv("KLINE_4H", "4h")
 KLINE_1D       = os.getenv("KLINE_1D", "1d")
 
 DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
-DEM_OB         = float(os.getenv("DEM_OB", "0.70"))
-DEM_OS         = float(os.getenv("DEM_OS", "0.30"))
+DEM_OB         = float(os.getenv("DEM_OB", "0.70"))   # можно поднять до 0.71 через ENV
+DEM_OS         = float(os.getenv("DEM_OS", "0.30"))   # можно опустить до 0.29 через ENV
 
 POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# публикация сигналов в приватную группу (как было)
+# публикация сигналов в приватную группу
 GROUP_CHAT_ID  = "-1002963303214"
 
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
@@ -27,6 +27,9 @@ SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
 # версия формата в ключе дедупа
 FORMAT_VER     = os.getenv("FORMAT_VER", "v3")
+
+# Небольшая «мертвая зона» на порогах (защита от округления)
+MARGIN         = float(os.getenv("DEM_MARGIN", "1e-6"))
 
 # ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
@@ -179,7 +182,7 @@ def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optio
         dem[i] = (up_s/denom) if denom != 0 else 0.5
     return dem
 
-# ======= CLOSED-BAR HELPERS (строго закрытые значения) =======
+# ======= CLOSED-BAR HELPERS =======
 def last_closed_value(series: List[Optional[float]]) -> Optional[float]:
     if not series or len(series) < 2:
         return None
@@ -198,7 +201,7 @@ def _valid_index(n: int, idx: int) -> bool:
     return -n <= idx < n
 
 def wick_ge_25pct_at(ohlc: List[List[float]], idx: int) -> bool:
-    if not ohlc or len(ohlc) < 2 or not _valid_index(len(ohlc), idx):
+    if not ohlc or len(ohlc) < 3 or not _valid_index(len(ohlc), idx):
         return False
     o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
     rng = max(h-l, 1e-12)
@@ -207,6 +210,7 @@ def wick_ge_25pct_at(ohlc: List[List[float]], idx: int) -> bool:
     return (upper >= 0.25*rng) or (lower >= 0.25*rng)
 
 def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
+    # base_idx обычно -2 (закрытая), нужна серия из >=2 противоположных перед ней
     need = (-base_idx) + 3
     if len(ohlc) < need or not _valid_index(len(ohlc), base_idx-3):
         return False
@@ -224,17 +228,20 @@ def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -
         if not (bull2 and bull3): return False
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
-def candle_pattern_ok_closed(ohlc: List[List[float]]) -> bool:
+def candle_pattern_ok_closed_if_zone(ohlc: List[List[float]], tf_zone_exists: bool) -> bool:
+    # Считаем паттерн ТОЛЬКО если TF уже в зоне, и только на закрытой свече (-2)
+    if not tf_zone_exists:
+        return False
     if not ohlc or len(ohlc) < 3:
         return False
     base_idx = -2
     return wick_ge_25pct_at(ohlc, base_idx) or engulfing_with_prior_opposition_at(ohlc, base_idx)
 
 # ============ SIGNAL UTILS ============
-def zone_of(v: Optional[float]) -> Optional[str]:
+def zone_of_closed(v: Optional[float]) -> Optional[str]:
     if v is None: return None
-    if v >= DEM_OB: return "OB"
-    if v <= DEM_OS: return "OS"
+    if v >= DEM_OB + MARGIN: return "OB"
+    if v <= DEM_OS - MARGIN: return "OS"
     return None
 
 def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> str:
@@ -286,26 +293,24 @@ def process_symbol(symbol: str) -> Optional[str]:
     if not dem4_series or not dem1_series:
         return None
 
-    # строго ЗАКРЫТЫЕ значения DeM
+    # ЗОНЫ — только по ЗАКРЫТЫМ значениям
     dem4 = last_closed_value(dem4_series)
     dem1 = last_closed_value(dem1_series)
+    z4 = zone_of_closed(dem4)
+    z1 = zone_of_closed(dem1)
 
-    # зоны только по закрытым
-    z4 = zone_of(dem4)
-    z1 = zone_of(dem1)
-
-    # паттерны считаем только если TF в зоне (на закрытой свече)
-    has_can_4 = candle_pattern_ok_closed(k4) if z4 is not None else False
-    has_can_1 = candle_pattern_ok_closed(k1) if z1 is not None else False
+    # Свечные паттерны считаем только если TF уже в зоне
+    has_can_4 = candle_pattern_ok_closed_if_zone(k4, z4 is not None)
+    has_can_1 = candle_pattern_ok_closed_if_zone(k1, z1 is not None)
 
     sig_type: Optional[str] = None
     zone_for_msg: Optional[str] = None
 
-    # ⚡ — только если ОБЕ зоны совпали на закрытых 4H и 1D
+    # ⚡ / ⚡🕯️ — только если ОБЕ зоны на закрытых 4H и 1D совпали
     if (z4 is not None) and (z1 is not None) and (z4 == z1):
         sig_type = "L+CAN" if (has_can_4 or has_can_1) else "LIGHT"
         zone_for_msg = z4
-    # 1TF+CAN — только если зона есть на ОДНОМ TF и там же есть свечной паттерн (оба на закрытых)
+    # 1TF+CAN — ровно один TF в зоне, и ТОЛЬКО на нём есть паттерн
     elif (z4 is not None) ^ (z1 is not None):
         if z4 is not None and has_can_4:
             sig_type = "1TF+CAN"; zone_for_msg = z4
@@ -316,7 +321,7 @@ def process_symbol(symbol: str) -> Optional[str]:
     else:
         return None
 
-    # дедуп по последней ЗАКРЫТОЙ дневной свече
+    # Дедуп — по последней ЗАКРЫТОЙ дневной свече (и запрет сигнала, если дневка не закрыта)
     last_ts_closed_1d = last_closed_ts(k1)
     if last_ts_closed_1d is None:
         return None
