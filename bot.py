@@ -18,6 +18,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# публикация сигналов в приватную группу
 GROUP_CHAT_ID  = "-1002963303214"
 
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
@@ -25,8 +26,7 @@ DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
 FORMAT_VER     = os.getenv("FORMAT_VER", "v3")
-
-# строгая «мертвая зона» по умолчанию: 1 п.п. (0.01)
+# строгая «мертвая зона» относительно порогов DeMarker (задаётся через ENV)
 MARGIN         = float(os.getenv("DEM_MARGIN", "0.01"))
 
 # ============ LOGGING ============
@@ -78,10 +78,14 @@ STATE = load_state(STATE_PATH)
 
 # ============ SEED ============
 STATIC_SYMBOLS: List[str] = [
+    # crypto majors
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
     "TON-USDT","LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT",
+    # metals / indices
     "XAU-USDT","XAG-USDT","US100","US500","US30","US2000","VIX",
+    # FX
     "EUR-USD","GBP-USD","USD-JPY","AUD-USD","USD-CAD","USD-CHF",
+    # tokenized stocks (если доступны)
     "TSLA-USDT","AAPL-USDT","NVDA-USDT","META-USDT","AMZN-USDT"
 ]
 
@@ -157,7 +161,8 @@ def fetch_contracts_dynamic() -> List[str]:
         sym = (it.get("symbol") or it.get("contractId") or "").upper()
         if not sym: continue
         ctype = (it.get("contractType") or it.get("type") or "").upper()
-        if "PERP" not in ctype: continue
+        if "PERP" not in ctype:  # только perp
+            continue
         out.append(sym.upper())
     return sorted(set(out))
 
@@ -220,7 +225,7 @@ def _valid_index(n: int, idx: int) -> bool:
     return -n <= idx < n
 
 def wick_ge_25pct_pin(ohlc: List[List[float]], idx: int) -> bool:
-    # Более строгий pin: один фитиль ≥25% диапазона и встречный фитиль ≤10% диапазона
+    # pin: один фитиль ≥25% диапазона и встречный фитиль ≤10%
     if not ohlc or len(ohlc) < 3 or not _valid_index(len(ohlc), idx):
         return False
     o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
@@ -232,6 +237,7 @@ def wick_ge_25pct_pin(ohlc: List[List[float]], idx: int) -> bool:
     return (big >= 0.25*rng) and (small <= 0.10*rng)
 
 def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
+    # поглощение базы -2, перед ней >=2 свечи противоположного цвета
     need = (-base_idx) + 3
     if len(ohlc) < need or not _valid_index(len(ohlc), base_idx-3):
         return False
@@ -250,6 +256,7 @@ def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
 def candle_pattern_ok_closed_if_zone(ohlc: List[List[float]], tf_zone_exists: bool) -> bool:
+    # считаем паттерн только если TF уже в зоне и только на закрытой свече (-2)
     if not tf_zone_exists: return False
     if not ohlc or len(ohlc) < 3: return False
     base_idx = -2
@@ -272,7 +279,9 @@ def tg_send_raw(text: str) -> bool:
         dprint("TG: пустой токен."); return False
     url = f"{TG_API}/sendMessage"
     ok_any = False
-    recipients = [TELEGRAM_CHAT] if TELEGRAM_CHAT else []
+    recipients = []
+    if TELEGRAM_CHAT:
+        recipients.append(TELEGRAM_CHAT)
     recipients.append(GROUP_CHAT_ID)
     for chat_id in recipients:
         form = {"chat_id": chat_id, "text": text, "disable_notification": True}
@@ -309,13 +318,13 @@ def process_symbol(symbol: str) -> Optional[str]:
     if not dem4_series or not dem1_series:
         return None
 
-    # Зоны — строго по ЗАКРЫТЫМ значениям + MARGIN
+    # зоны — строго по ЗАКРЫТЫМ значениям + MARGIN
     dem4 = last_closed_value(dem4_series)
     dem1 = last_closed_value(dem1_series)
     z4 = zone_of_closed(dem4)
     z1 = zone_of_closed(dem1)
 
-    # Паттерны — только если TF уже в зоне и на закрытой свече
+    # свечные паттерны — только если TF уже в зоне и только на закрытой свече
     has_can_4 = candle_pattern_ok_closed_if_zone(k4, z4 is not None)
     has_can_1 = candle_pattern_ok_closed_if_zone(k1, z1 is not None)
 
@@ -337,7 +346,7 @@ def process_symbol(symbol: str) -> Optional[str]:
     else:
         return None
 
-    # Дедуп только по ЗАКРЫТОЙ дневке
+    # дедуп — только по ЗАКРЫТОЙ дневке (страховка от интрабара)
     last_ts_closed_1d = last_closed_ts(k1)
     if last_ts_closed_1d is None:
         return None
@@ -356,12 +365,13 @@ def main_loop():
     if not symbols:
         symbols = ["BTC-USDT"]
 
+    # Тихий старт — три строки
     logging.info(f"INFO: Symbols loaded: {len(symbols)}")
     logging.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     logging.info(f"INFO: First symbol checked: {symbols[0]}")
 
     if SELFTEST_PING:
-        tg_send_raw("🟢↑⚡🕯️")
+        tg_send_raw("🟢↑⚡🕯️")  # разовый тест-формат
 
     while True:
         sent_any = False
