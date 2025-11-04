@@ -26,7 +26,7 @@ DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
 # версия формата (для совместимости со state)
-FORMAT_VER     = os.getenv("FORMAT_VER", "v5")
+FORMAT_VER     = os.getenv("FORMAT_VER", "v6")
 
 # ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
@@ -219,12 +219,11 @@ def last_closed_ts(ohlc: List[List[float]]) -> Optional[int]:
     if not ohlc or len(ohlc) < 2: return None
     return int(ohlc[-2][0])
 
-# ============ ZONES (строго 0.70 / 0.30, округление к визуалу) ============
+# ============ ZONES (СТРОГО, БЕЗ ОКРУГЛЕНИЯ) ============
 def zone_of_closed(v: Optional[float]) -> Optional[str]:
     if v is None: return None
-    vv = round(float(v), 2)
-    if vv >= 0.70: return "OB"
-    if vv <= 0.30: return "OS"
+    if v >= DEM_OB: return "OB"
+    if v <= DEM_OS: return "OS"
     return None
 
 # ============ CANDLE PATTERNS (только закрытая свеча и только в зоне) ============
@@ -326,30 +325,30 @@ def process_symbol(symbol: str) -> Optional[str]:
     if ts4 is None or ts1 is None:
         return None
 
+    if DEBUG_SCAN:
+        dprint(f"{symbol} 4H={z4} 1D={z1} dem4={dem4:.4f if dem4 is not None else None} "
+               f"dem1={dem1:.4f if dem1 is not None else None} pat4={has_can_4} pat1={has_can_1} "
+               f"ts4={ts4} ts1={ts1}")
+
     sig_type: Optional[str] = None
     zone_for_msg: Optional[str] = None
     pat_tf = "-"
 
-    # === МОЛНИЯ: только когда ОБЕ ЗАКРЫТЫЕ зоны совпали и только на закрытии дневки ===
+    # === МОЛНИЯ: ОБЕ ПОСЛЕДНИЕ ЗАКРЫТЫЕ свечи (4H и 1D) в ОДНОЙ зоне (OB/OS) ===
     if (z4 is not None) and (z1 is not None) and (z4 == z1):
-        # gate: один раз на каждый закрытый дневной бар
-        gate_key = f"{FORMAT_VER}|GATE|{symbol}|{ts1}"
-        if not STATE["sent"].get(gate_key):
-            if has_can_4 or has_can_1:
-                sig_type = "L+CAN"
-                pat_tf = "4H" if has_can_4 else "1D"
-            else:
-                sig_type = "LIGHT"
-            zone_for_msg = z4
-            key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
-            if not STATE["sent"].get(key):
-                if tg_send_signal(symbol, sig_type, zone_for_msg):
-                    STATE["sent"][key] = int(time.time())
-                    STATE["sent"][gate_key] = 1
-                    return symbol
+        if has_can_4 or has_can_1:
+            sig_type = "L+CAN"; pat_tf = "4H" if has_can_4 else "1D"
+        else:
+            sig_type = "LIGHT"
+        zone_for_msg = z4
+        key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
+        if not STATE["sent"].get(key):
+            if tg_send_signal(symbol, sig_type, zone_for_msg):
+                STATE["sent"][key] = int(time.time())
+                return symbol
         return None
 
-    # === 1TF+CAN: ровно один TF в зоне и на нём же есть паттерн ===
+    # === 1TF+CAN: ровно один TF в зоне и на нём же есть паттерн (всё — по закрытой свече) ===
     if (z4 is not None) ^ (z1 is not None):
         if z4 is not None and has_can_4:
             sig_type = "1TF+CAN"; zone_for_msg = z4; pat_tf = "4H"
@@ -371,7 +370,6 @@ def main_loop():
     if not symbols:
         symbols = ["BTC-USDT"]
 
-    # Тихий старт — три строки
     logging.info(f"INFO: Symbols loaded: {len(symbols)}")
     logging.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     logging.info(f"INFO: First symbol checked: {symbols[0]}")
