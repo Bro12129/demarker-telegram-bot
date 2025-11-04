@@ -1,6 +1,6 @@
 # bot.py
 import os, time, json, logging, requests
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 # ============ ENV ============
 BINGX_BASE     = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
@@ -18,14 +18,14 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# >>> ADD: чат группы для публикации сигналов <<<
-GROUP_CHAT_ID  = "-1002963303214"  # приватная группа для сигналов
+# публикация сигналов в приватную группу (как было)
+GROUP_CHAT_ID  = "-1002963303214"
 
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
 DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
-# Версия формата для обхода дедупа при смене эмодзи/логики
+# версия формата в ключе дедупа
 FORMAT_VER     = os.getenv("FORMAT_VER", "v3")
 
 # ============ LOGGING ============
@@ -75,8 +75,8 @@ def save_state(path: str, data: Dict) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ SEED (на случай, если API не даст список) ============
-STATIC_SYMBOLS: List[str] = [
+# ============ SEED ============
+STATIC_SYMBOLS = [
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
     "TON-USDT","LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT",
     "XAU-USDT","XAG-USDT","US100","US500","US30","US2000","VIX",
@@ -119,6 +119,15 @@ def get_symbols() -> List[str]:
     return cached if cached else STATIC_SYMBOLS[:]
 
 # ============ KLINES ============
+def _pick_num(d: Dict, *keys: str) -> Optional[float]:
+    for k in keys:
+        if k in d and d[k] is not None:
+            try:
+                return float(d[k])
+            except Exception:
+                continue
+    return None
+
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
     url = f"{BINGX_BASE}/openApi/swap/v3/quote/klines"
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
@@ -131,7 +140,12 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
         if isinstance(k, dict):
             try:
                 t = int(k.get("openTime") or k.get("time") or k.get("t"))
-                o = float(k.get("open")); h = float(k.get("high")); l = float(k.get("low")); c = float(k.get("close"))
+                o = _pick_num(k, "open", "o", "openPrice")
+                h = _pick_num(k, "high", "h", "highPrice")
+                l = _pick_num(k, "low",  "l", "lowPrice")
+                c = _pick_num(k, "close","c", "closePrice")
+                if None in (o,h,l,c):
+                    continue
             except Exception:
                 continue
         else:
@@ -154,20 +168,37 @@ def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optio
     for i in range(1, len(ohlc)):
         up.append(max(highs[i]-highs[i-1], 0.0))
         dn.append(max(lows[i-1]-lows[i], 0.0))
-    def sma(arr: List[float], i: int, n: int) -> float:
+    def sma(arr, i, n):
         s = 0.0
         for k in range(i-n+1, i+1): s += arr[k]
         return s / n
     dem: List[Optional[float]] = [None]*len(ohlc)
-    for i in range(DEM_LEN, len(ohlc)):
-        up_s = sma(up, i, DEM_LEN); dn_s = sma(dn, i, DEM_LEN)
+    for i in range(length, len(ohlc)):
+        up_s = sma(up, i, length); dn_s = sma(dn, i, length)
         denom = up_s + dn_s
         dem[i] = (up_s/denom) if denom != 0 else 0.5
     return dem
 
-# ============ CANDLE PATTERNS (ТОЛЬКО ЗАКРЫТАЯ СВЕЧА) ============
+# ======= CLOSED-BAR HELPERS (строго закрытые значения) =======
+def last_closed_value(series: List[Optional[float]]) -> Optional[float]:
+    if not series or len(series) < 2:
+        return None
+    i = len(series) - 2
+    while i >= 0 and series[i] is None:
+        i -= 1
+    return series[i] if i >= 0 else None
+
+def last_closed_ts(ohlc: List[List[float]]) -> Optional[int]:
+    if not ohlc or len(ohlc) < 2:
+        return None
+    return int(ohlc[-2][0])
+
+# ============ CANDLE PATTERNS (только закрытая свеча) ============
+def _valid_index(n: int, idx: int) -> bool:
+    return -n <= idx < n
+
 def wick_ge_25pct_at(ohlc: List[List[float]], idx: int) -> bool:
-    if len(ohlc) < (-idx) or len(ohlc) < 2:  # достаточно данных?
+    if not ohlc or len(ohlc) < 2 or not _valid_index(len(ohlc), idx):
         return False
     o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
     rng = max(h-l, 1e-12)
@@ -176,9 +207,8 @@ def wick_ge_25pct_at(ohlc: List[List[float]], idx: int) -> bool:
     return (upper >= 0.25*rng) or (lower >= 0.25*rng)
 
 def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
-    # Базовая (engulf) = закрытая свеча base_idx (обычно -2)
-    need = (-base_idx) + 3  # base, prev1, prev2, prev3
-    if len(ohlc) < need:
+    need = (-base_idx) + 3
+    if len(ohlc) < need or not _valid_index(len(ohlc), base_idx-3):
         return False
     o0,h0,l0,c0 = ohlc[base_idx][1], ohlc[base_idx][2], ohlc[base_idx][3], ohlc[base_idx][4]
     o1,h1,l1,c1 = ohlc[base_idx-1][1], ohlc[base_idx-1][2], ohlc[base_idx-1][3], ohlc[base_idx-1][4]
@@ -195,7 +225,6 @@ def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
 def candle_pattern_ok_closed(ohlc: List[List[float]]) -> bool:
-    # Ищем только на последней ЗАКРЫТОЙ свече (index = -2)
     if not ohlc or len(ohlc) < 3:
         return False
     base_idx = -2
@@ -216,18 +245,13 @@ def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> st
 def tg_send_raw(text: str) -> bool:
     if not TELEGRAM_TOKEN:
         dprint("TG: пустой токен."); return False
-
     url = f"{TG_API}/sendMessage"
     ok_any = False
-
-    # отправляем в BOT_CHAT (если задан), затем всегда в GROUP_CHAT_ID
     recipients = []
     if TELEGRAM_CHAT:
         recipients.append(TELEGRAM_CHAT)
     recipients.append(GROUP_CHAT_ID)
-
     for chat_id in recipients:
-        # два варианта (form/json) с повторами — как у тебя было
         form = {"chat_id": chat_id, "text": text, "disable_notification": True}
         jsn  = {"chat_id": chat_id, "text": text, "disable_notification": True}
         delivered = False
@@ -241,21 +265,15 @@ def tg_send_raw(text: str) -> bool:
                 try: delivered = (r.status_code == 200) and (r.json().get("ok") is True)
                 except Exception: delivered = False
         ok_any = ok_any or delivered
-        # небольшая пауза между получателями
         time.sleep(0.05)
-
     return ok_any
 
 def tg_send_signal(symbol: str, signal_type: str, zone: Optional[str]) -> bool:
     return tg_send_raw(format_signal_text(symbol, signal_type, zone))
 
 # ============ CORE ============
-def last_value(series: List[Optional[float]]) -> Optional[float]:
-    return series[-1] if series else None
-
-def build_dedup_key(symbol: str, signal_type: str, zone: Optional[str], last_ts: int) -> str:
-    # Включаем версию формата в ключ, чтобы новые правила не блокировались старым state.json
-    return f"{FORMAT_VER}|{symbol}|{signal_type}|{zone or '-'}|{last_ts}"
+def build_dedup_key(symbol: str, signal_type: str, zone: Optional[str], last_ts_closed_1d: int) -> str:
+    return f"{FORMAT_VER}|{symbol}|{signal_type}|{zone or '-'}|{last_ts_closed_1d}"
 
 def process_symbol(symbol: str) -> Optional[str]:
     k4 = fetch_klines(symbol, KLINE_4H, limit=max(200, DEM_LEN + 10))
@@ -268,27 +286,27 @@ def process_symbol(symbol: str) -> Optional[str]:
     if not dem4_series or not dem1_series:
         return None
 
-    dem4 = last_value(dem4_series)
-    dem1 = last_value(dem1_series)
+    # строго ЗАКРЫТЫЕ значения DeM
+    dem4 = last_closed_value(dem4_series)
+    dem1 = last_closed_value(dem1_series)
 
-    # Зоны по каждому ТФ
-    z4 = zone_of(dem4)   # "OB" / "OS" / None
+    # зоны только по закрытым
+    z4 = zone_of(dem4)
     z1 = zone_of(dem1)
 
-    # Свечной паттерн считаем ТОЛЬКО на тех ТФ, где есть зона
+    # паттерны считаем только если TF в зоне (на закрытой свече)
     has_can_4 = candle_pattern_ok_closed(k4) if z4 is not None else False
     has_can_1 = candle_pattern_ok_closed(k1) if z1 is not None else False
 
-    # Классификация строго по правилам
     sig_type: Optional[str] = None
     zone_for_msg: Optional[str] = None
 
+    # ⚡ — только если ОБЕ зоны совпали на закрытых 4H и 1D
     if (z4 is not None) and (z1 is not None) and (z4 == z1):
-        # обе DeM в одной зоне
         sig_type = "L+CAN" if (has_can_4 or has_can_1) else "LIGHT"
         zone_for_msg = z4
+    # 1TF+CAN — только если зона есть на ОДНОМ TF и там же есть свечной паттерн (оба на закрытых)
     elif (z4 is not None) ^ (z1 is not None):
-        # только один ТФ в зоне, нужен паттерн на ЭТОМ ТФ
         if z4 is not None and has_can_4:
             sig_type = "1TF+CAN"; zone_for_msg = z4
         elif z1 is not None and has_can_1:
@@ -298,8 +316,12 @@ def process_symbol(symbol: str) -> Optional[str]:
     else:
         return None
 
-    last_ts_1d = k1[-1][0]  # дедуп к текущему дневному бару
-    key = build_dedup_key(symbol, sig_type, zone_for_msg, last_ts_1d)
+    # дедуп по последней ЗАКРЫТОЙ дневной свече
+    last_ts_closed_1d = last_closed_ts(k1)
+    if last_ts_closed_1d is None:
+        return None
+
+    key = build_dedup_key(symbol, sig_type, zone_for_msg, last_ts_closed_1d)
     if STATE["sent"].get(key):
         return None
 
@@ -319,7 +341,7 @@ def main_loop():
     logging.info(f"INFO: First symbol checked: {symbols[0]}")
 
     if SELFTEST_PING:
-        tg_send_raw("🟢↑⚡🕯️")  # тест-формат один раз
+        tg_send_raw("🟢↑⚡🕯️")  # разовый тест-формат
 
     while True:
         sent_any = False
@@ -329,8 +351,9 @@ def main_loop():
                 processed += 1
                 if process_symbol(sym):
                     sent_any = True
-            except Exception:
-                pass
+            except Exception as e:
+                if DEBUG_SCAN:
+                    dprint(f"ERR {sym}: {e}")
         if sent_any:
             save_state(STATE_PATH, STATE)
         if DEBUG_SCAN:
