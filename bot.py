@@ -1,5 +1,5 @@
 # bot.py
-import os, time, json, logging, requests
+import os, time, json, logging, requests, re
 from typing import List, Dict, Optional
 
 # ============ ENV ============
@@ -8,8 +8,8 @@ KLINE_4H       = os.getenv("KLINE_4H", "4h")
 KLINE_1D       = os.getenv("KLINE_1D", "1d")
 
 DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
-DEM_OB         = float(os.getenv("DEM_OB", "0.70"))   # можно поднять до 0.71 через ENV
-DEM_OS         = float(os.getenv("DEM_OS", "0.30"))   # можно опустить до 0.29 через ENV
+DEM_OB         = float(os.getenv("DEM_OB", "0.70"))
+DEM_OS         = float(os.getenv("DEM_OS", "0.30"))
 
 POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
@@ -18,18 +18,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# публикация сигналов в приватную группу
 GROUP_CHAT_ID  = "-1002963303214"
 
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
 DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
-# версия формата в ключе дедупа
 FORMAT_VER     = os.getenv("FORMAT_VER", "v3")
 
-# Небольшая «мертвая зона» на порогах (защита от округления)
-MARGIN         = float(os.getenv("DEM_MARGIN", "1e-6"))
+# строгая «мертвая зона» по умолчанию: 1 п.п. (0.01)
+MARGIN         = float(os.getenv("DEM_MARGIN", "0.01"))
 
 # ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
@@ -79,49 +77,33 @@ def save_state(path: str, data: Dict) -> None:
 STATE = load_state(STATE_PATH)
 
 # ============ SEED ============
-STATIC_SYMBOLS = [
+STATIC_SYMBOLS: List[str] = [
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
     "TON-USDT","LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT",
     "XAU-USDT","XAG-USDT","US100","US500","US30","US2000","VIX",
-    "EUR-USD","GBP-USD","USD-JPY","AUD-USD","USD-CAD","USD-CHF"
+    "EUR-USD","GBP-USD","USD-JPY","AUD-USD","USD-CAD","USD-CHF",
+    "TSLA-USDT","AAPL-USDT","NVDA-USDT","META-USDT","AMZN-USDT"
 ]
 
-# ============ SYMBOLS ============
-def fetch_contracts_dynamic() -> List[str]:
-    url = f"{BINGX_BASE}/openApi/swap/v2/quote/contracts"
-    data = http_get(url, params={}) or {}
-    items = data.get("data") or data.get("symbolList") or []
-    out: List[str] = []
-    for it in items:
-        sym = (it.get("symbol") or it.get("contractId") or "").upper()
-        if not sym:
-            continue
-        ctype = (it.get("contractType") or it.get("type") or "").upper()
-        if "PERP" not in ctype:
-            continue
-        cat = (it.get("category") or it.get("assetType") or "").lower()
-        s = sym.upper()
-        if s in {"US100","US500","US30","US2000","VIX","XAU-USDT","XAG-USDT"}:
-            out.append(s); continue
-        if "stock" in cat or "xstock" in cat:
-            out.append(s); continue
-        if "-" in s and len(s) == 7 and s[3] == "-":   # FX
-            out.append(s); continue
-        if s.endswith("-USDT"):                        # crypto
-            out.append(s); continue
-    return sorted(set(out))
+# ============ SYMBOL RESOLVER ============
+def symbol_variants(sym: str) -> List[str]:
+    v: List[str] = []
+    s = sym.upper()
+    v.append(s)
+    if "-" not in s and not s.endswith("-USDT"):
+        v.append(f"{s}-USDT")
+    m = re.fullmatch(r"([A-Z]{3,4})USDT", s)
+    if m:
+        v.append(f"{m.group(1)}-USDT")
+    if s in ("XAU-USDT","XAUUSD"): v += ["XAUUSD","XAU-USDT"]
+    if s in ("XAG-USDT","XAGUSD"): v += ["XAGUSD","XAG-USDT"]
+    if s in ("US100","US500","US30","US2000","VIX"): v.append(f"{s}-USDT")
+    seen=set(); out=[]
+    for x in v:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
 
-def get_symbols() -> List[str]:
-    dyn = fetch_contracts_dynamic()
-    if dyn:
-        universe = sorted(set(dyn) | set(STATIC_SYMBOLS))
-        STATE["universe"] = universe
-        save_state(STATE_PATH, STATE)
-        return universe
-    cached = STATE.get("universe") or []
-    return cached if cached else STATIC_SYMBOLS[:]
-
-# ============ KLINES ============
 def _pick_num(d: Dict, *keys: str) -> Optional[float]:
     for k in keys:
         if k in d and d[k] is not None:
@@ -131,24 +113,15 @@ def _pick_num(d: Dict, *keys: str) -> Optional[float]:
                 continue
     return None
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
-    url = f"{BINGX_BASE}/openApi/swap/v3/quote/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
-    data = http_get(url, params=params)
-    if not data:
-        return None
-    raw = data.get("data") or data.get("klines") or []
+def _parse_klines_payload(raw) -> Optional[List[List[float]]]:
     out: List[List[float]] = []
     for k in raw:
         if isinstance(k, dict):
             try:
                 t = int(k.get("openTime") or k.get("time") or k.get("t"))
-                o = _pick_num(k, "open", "o", "openPrice")
-                h = _pick_num(k, "high", "h", "highPrice")
-                l = _pick_num(k, "low",  "l", "lowPrice")
-                c = _pick_num(k, "close","c", "closePrice")
-                if None in (o,h,l,c):
-                    continue
+                o = _pick_num(k, "open","o","openPrice"); h = _pick_num(k, "high","h","highPrice")
+                l = _pick_num(k, "low","l","lowPrice");  c = _pick_num(k, "close","c","closePrice")
+                if None in (o,h,l,c): continue
             except Exception:
                 continue
         else:
@@ -156,11 +129,60 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
                 t = int(k[0]); o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
             except Exception:
                 continue
-        if h <= 0 or l <= 0:
-            continue
+        if h <= 0 or l <= 0: continue
         out.append([t,o,h,l,c])
     out.sort(key=lambda x: x[0])
     return out or None
+
+def fetch_klines_once(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
+    url = f"{BINGX_BASE}/openApi/swap/v3/quote/klines"
+    data = http_get(url, params={"symbol": symbol, "interval": interval, "limit": str(limit)})
+    if not data: return None
+    raw = data.get("data") or data.get("klines") or []
+    return _parse_klines_payload(raw)
+
+def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
+    for alias in symbol_variants(symbol):
+        out = fetch_klines_once(alias, interval, limit)
+        if out: return out
+    return None
+
+# ============ SYMBOLS DISCOVERY ============
+def fetch_contracts_dynamic() -> List[str]:
+    url = f"{BINGX_BASE}/openApi/swap/v2/quote/contracts"
+    data = http_get(url, params={}) or {}
+    items = data.get("data") or data.get("symbolList") or []
+    out: List[str] = []
+    for it in items:
+        sym = (it.get("symbol") or it.get("contractId") or "").upper()
+        if not sym: continue
+        ctype = (it.get("contractType") or it.get("type") or "").upper()
+        if "PERP" not in ctype: continue
+        out.append(sym.upper())
+    return sorted(set(out))
+
+def validate_symbols(cands: List[str]) -> List[str]:
+    valid: List[str] = []
+    for s in cands:
+        try:
+            k = fetch_klines(s, KLINE_1D, limit=5)
+            if k and len(k) >= 2:
+                valid.append(s)
+        except Exception:
+            pass
+        time.sleep(0.01)
+    return valid
+
+def get_symbols() -> List[str]:
+    dyn = fetch_contracts_dynamic()
+    universe = sorted(set(dyn) | set(STATIC_SYMBOLS))
+    valid = validate_symbols(universe)
+    if valid:
+        STATE["universe"] = valid
+        save_state(STATE_PATH, STATE)
+        return valid
+    cached = STATE.get("universe") or []
+    return cached if cached else STATIC_SYMBOLS[:]
 
 # ============ INDICATORS ============
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
@@ -184,33 +206,32 @@ def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optio
 
 # ======= CLOSED-BAR HELPERS =======
 def last_closed_value(series: List[Optional[float]]) -> Optional[float]:
-    if not series or len(series) < 2:
-        return None
+    if not series or len(series) < 2: return None
     i = len(series) - 2
-    while i >= 0 and series[i] is None:
-        i -= 1
+    while i >= 0 and series[i] is None: i -= 1
     return series[i] if i >= 0 else None
 
 def last_closed_ts(ohlc: List[List[float]]) -> Optional[int]:
-    if not ohlc or len(ohlc) < 2:
-        return None
+    if not ohlc or len(ohlc) < 2: return None
     return int(ohlc[-2][0])
 
 # ============ CANDLE PATTERNS (только закрытая свеча) ============
 def _valid_index(n: int, idx: int) -> bool:
     return -n <= idx < n
 
-def wick_ge_25pct_at(ohlc: List[List[float]], idx: int) -> bool:
+def wick_ge_25pct_pin(ohlc: List[List[float]], idx: int) -> bool:
+    # Более строгий pin: один фитиль ≥25% диапазона и встречный фитиль ≤10% диапазона
     if not ohlc or len(ohlc) < 3 or not _valid_index(len(ohlc), idx):
         return False
     o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
     rng = max(h-l, 1e-12)
     upper = h - max(o,c)
     lower = min(o,c) - l
-    return (upper >= 0.25*rng) or (lower >= 0.25*rng)
+    big = max(upper, lower)
+    small = min(upper, lower)
+    return (big >= 0.25*rng) and (small <= 0.10*rng)
 
 def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
-    # base_idx обычно -2 (закрытая), нужна серия из >=2 противоположных перед ней
     need = (-base_idx) + 3
     if len(ohlc) < need or not _valid_index(len(ohlc), base_idx-3):
         return False
@@ -229,13 +250,10 @@ def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
 def candle_pattern_ok_closed_if_zone(ohlc: List[List[float]], tf_zone_exists: bool) -> bool:
-    # Считаем паттерн ТОЛЬКО если TF уже в зоне, и только на закрытой свече (-2)
-    if not tf_zone_exists:
-        return False
-    if not ohlc or len(ohlc) < 3:
-        return False
+    if not tf_zone_exists: return False
+    if not ohlc or len(ohlc) < 3: return False
     base_idx = -2
-    return wick_ge_25pct_at(ohlc, base_idx) or engulfing_with_prior_opposition_at(ohlc, base_idx)
+    return wick_ge_25pct_pin(ohlc, base_idx) or engulfing_with_prior_opposition_at(ohlc, base_idx)
 
 # ============ SIGNAL UTILS ============
 def zone_of_closed(v: Optional[float]) -> Optional[str]:
@@ -254,9 +272,7 @@ def tg_send_raw(text: str) -> bool:
         dprint("TG: пустой токен."); return False
     url = f"{TG_API}/sendMessage"
     ok_any = False
-    recipients = []
-    if TELEGRAM_CHAT:
-        recipients.append(TELEGRAM_CHAT)
+    recipients = [TELEGRAM_CHAT] if TELEGRAM_CHAT else []
     recipients.append(GROUP_CHAT_ID)
     for chat_id in recipients:
         form = {"chat_id": chat_id, "text": text, "disable_notification": True}
@@ -293,24 +309,24 @@ def process_symbol(symbol: str) -> Optional[str]:
     if not dem4_series or not dem1_series:
         return None
 
-    # ЗОНЫ — только по ЗАКРЫТЫМ значениям
+    # Зоны — строго по ЗАКРЫТЫМ значениям + MARGIN
     dem4 = last_closed_value(dem4_series)
     dem1 = last_closed_value(dem1_series)
     z4 = zone_of_closed(dem4)
     z1 = zone_of_closed(dem1)
 
-    # Свечные паттерны считаем только если TF уже в зоне
+    # Паттерны — только если TF уже в зоне и на закрытой свече
     has_can_4 = candle_pattern_ok_closed_if_zone(k4, z4 is not None)
     has_can_1 = candle_pattern_ok_closed_if_zone(k1, z1 is not None)
 
     sig_type: Optional[str] = None
     zone_for_msg: Optional[str] = None
 
-    # ⚡ / ⚡🕯️ — только если ОБЕ зоны на закрытых 4H и 1D совпали
+    # ⚡ / ⚡🕯️ — только если ОБЕ закрытые зоны совпали
     if (z4 is not None) and (z1 is not None) and (z4 == z1):
         sig_type = "L+CAN" if (has_can_4 or has_can_1) else "LIGHT"
         zone_for_msg = z4
-    # 1TF+CAN — ровно один TF в зоне, и ТОЛЬКО на нём есть паттерн
+    # 1TF+CAN — ровно один TF в зоне и на нём же есть паттерн
     elif (z4 is not None) ^ (z1 is not None):
         if z4 is not None and has_can_4:
             sig_type = "1TF+CAN"; zone_for_msg = z4
@@ -321,7 +337,7 @@ def process_symbol(symbol: str) -> Optional[str]:
     else:
         return None
 
-    # Дедуп — по последней ЗАКРЫТОЙ дневной свече (и запрет сигнала, если дневка не закрыта)
+    # Дедуп только по ЗАКРЫТОЙ дневке
     last_ts_closed_1d = last_closed_ts(k1)
     if last_ts_closed_1d is None:
         return None
@@ -340,13 +356,12 @@ def main_loop():
     if not symbols:
         symbols = ["BTC-USDT"]
 
-    # Тихий старт — три строки
     logging.info(f"INFO: Symbols loaded: {len(symbols)}")
     logging.info(f"INFO: Loaded {len(symbols)} symbols for scan.")
     logging.info(f"INFO: First symbol checked: {symbols[0]}")
 
     if SELFTEST_PING:
-        tg_send_raw("🟢↑⚡🕯️")  # разовый тест-формат
+        tg_send_raw("🟢↑⚡🕯️")
 
     while True:
         sent_any = False
