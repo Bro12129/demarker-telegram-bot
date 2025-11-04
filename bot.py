@@ -18,23 +18,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Публикация сигналов (личка опционально + группа)
+# публикация в приватную группу
 GROUP_CHAT_ID  = "-1002963303214"
 
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
 DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
-# Версии формата — чтобы старый state не мешал новому дедупу
-FORMAT_VER     = os.getenv("FORMAT_VER", "v4")
-
-# «Мёртвая зона» вокруг порогов (по умолчанию 0.01 => OB≥0.71, OS≤0.29)
-MARGIN         = float(os.getenv("DEM_MARGIN", "0.01"))
-
-# Строгий pin-bar
-PIN_BIG_MIN    = float(os.getenv("PIN_BIG_MIN", "0.35"))  # один фитиль ≥35% диапазона
-PIN_SMALL_MAX  = float(os.getenv("PIN_SMALL_MAX", "0.05"))# встречный фитиль ≤5%
-PIN_BODY_MAX   = float(os.getenv("PIN_BODY_MAX", "0.40")) # тело ≤40% диапазона
+# версия формата (для совместимости со state)
+FORMAT_VER     = os.getenv("FORMAT_VER", "v5")
 
 # ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
@@ -83,7 +75,7 @@ def save_state(path: str, data: Dict) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ SEED (на случай, если динамика не отработает) ============
+# ============ SEED ============
 STATIC_SYMBOLS: List[str] = [
     # crypto majors
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
@@ -155,7 +147,8 @@ def fetch_klines_once(symbol: str, interval: str, limit: int = 200) -> Optional[
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
     for alias in symbol_variants(symbol):
         out = fetch_klines_once(alias, interval, limit)
-        if out: return out
+        if out:
+            return out
     return None
 
 # ============ SYMBOLS DISCOVERY ============
@@ -195,7 +188,7 @@ def get_symbols() -> List[str]:
     cached = STATE.get("universe") or []
     return cached if cached else STATIC_SYMBOLS[:]
 
-# ============ INDICATORS ============
+# ============ INDICATOR ============
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
     if not ohlc or len(ohlc) < length + 2:
         return None
@@ -226,19 +219,24 @@ def last_closed_ts(ohlc: List[List[float]]) -> Optional[int]:
     if not ohlc or len(ohlc) < 2: return None
     return int(ohlc[-2][0])
 
-# ============ CANDLE PATTERNS (только закрытая свеча) ============
-def wick_ge_25pct_pin(ohlc: List[List[float]], idx: int) -> bool:
-    # pin: один фитиль доминирует, тело небольшое
+# ============ ZONES (строго 0.70 / 0.30, округление к визуалу) ============
+def zone_of_closed(v: Optional[float]) -> Optional[str]:
+    if v is None: return None
+    vv = round(float(v), 2)
+    if vv >= 0.70: return "OB"
+    if vv <= 0.30: return "OS"
+    return None
+
+# ============ CANDLE PATTERNS (только закрытая свеча и только в зоне) ============
+def wick_ge_pct(ohlc: List[List[float]], idx: int, pct: float = 0.25) -> bool:
     if not ohlc or len(ohlc) < 3 or not (-len(ohlc) <= idx < len(ohlc)):
         return False
     o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
     rng = max(h-l, 1e-12)
-    body = abs(c - o)
     upper = h - max(o,c)
     lower = min(o,c) - l
-    big   = max(upper, lower)
-    small = min(upper, lower)
-    return (big >= PIN_BIG_MIN*rng) and (small <= PIN_SMALL_MAX*rng) and (body <= PIN_BODY_MAX*rng)
+    thr = pct * rng
+    return (upper >= thr) or (lower >= thr)
 
 def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
     need = (-base_idx) + 3
@@ -258,20 +256,13 @@ def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -
         if not (bull2 and bull3): return False
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
-def candle_pattern_ok_closed_if_zone(ohlc: List[List[float]], tf_zone_exists: bool) -> bool:
-    # считаем паттерн только если TF уже в зоне и только на закрытой свече (-2)
-    if not tf_zone_exists or not ohlc or len(ohlc) < 3:
+def candle_pattern_ok_closed_if_zone(ohlc: List[List[float]], zone_exists: bool) -> bool:
+    if not zone_exists or not ohlc or len(ohlc) < 3:
         return False
-    base_idx = -2
-    return wick_ge_25pct_pin(ohlc, base_idx) or engulfing_with_prior_opposition_at(ohlc, base_idx)
+    base_idx = -2  # строго закрытая
+    return wick_ge_pct(ohlc, base_idx, 0.25) or engulfing_with_prior_opposition_at(ohlc, base_idx)
 
 # ============ SIGNAL UTILS ============
-def zone_of_closed(v: Optional[float]) -> Optional[str]:
-    if v is None: return None
-    if v >= DEM_OB + MARGIN: return "OB"
-    if v <= DEM_OS - MARGIN: return "OS"
-    return None
-
 def format_signal_text(symbol: str, signal_type: str, zone: Optional[str]) -> str:
     arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
     status = "⚡" if signal_type == "LIGHT" else ("⚡🕯️" if signal_type == "L+CAN" else "🕯️")
@@ -309,8 +300,6 @@ def tg_send_signal(symbol: str, signal_type: str, zone: Optional[str]) -> bool:
 # ============ CORE ============
 def build_dedup_key(symbol: str, signal_type: str, zone: Optional[str],
                     ts_1d: int, ts_4h: int, pat_tf: str = "-") -> str:
-    # Для LIGHT — учитываем и 1D, и 4H (повтор каждые новые 4H/1D закрытия).
-    # Для паттернов — учитываем TF паттерна, чтобы можно было повторять при новом формировании.
     return f"{FORMAT_VER}|{symbol}|{signal_type}|{zone or '-'}|{ts_1d}|{ts_4h}|{pat_tf}"
 
 def process_symbol(symbol: str) -> Optional[str]:
@@ -324,13 +313,11 @@ def process_symbol(symbol: str) -> Optional[str]:
     if not dem4_series or not dem1_series:
         return None
 
-    # зоны — строго по ЗАКРЫТЫМ значениям + MARGIN
     dem4 = last_closed_value(dem4_series)
     dem1 = last_closed_value(dem1_series)
     z4 = zone_of_closed(dem4)
     z1 = zone_of_closed(dem1)
 
-    # свечные паттерны — только если TF уже в зоне и только на закрытой свече
     has_can_4 = candle_pattern_ok_closed_if_zone(k4, z4 is not None)
     has_can_1 = candle_pattern_ok_closed_if_zone(k1, z1 is not None)
 
@@ -343,39 +330,38 @@ def process_symbol(symbol: str) -> Optional[str]:
     zone_for_msg: Optional[str] = None
     pat_tf = "-"
 
-    # ⚡ / ⚡🕯️ — только если ОБЕ закрытые зоны совпали
+    # === МОЛНИЯ: только когда ОБЕ ЗАКРЫТЫЕ зоны совпали и только на закрытии дневки ===
     if (z4 is not None) and (z1 is not None) and (z4 == z1):
-        if has_can_4 or has_can_1:
-            sig_type = "L+CAN"
-            pat_tf = "4H" if has_can_4 else "1D"
-        else:
-            sig_type = "LIGHT"
-        zone_for_msg = z4
-
-        key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
-        if STATE["sent"].get(key):
-            return None
-        if tg_send_signal(symbol, sig_type, zone_for_msg):
-            STATE["sent"][key] = int(time.time())
-            return symbol
+        # gate: один раз на каждый закрытый дневной бар
+        gate_key = f"{FORMAT_VER}|GATE|{symbol}|{ts1}"
+        if not STATE["sent"].get(gate_key):
+            if has_can_4 or has_can_1:
+                sig_type = "L+CAN"
+                pat_tf = "4H" if has_can_4 else "1D"
+            else:
+                sig_type = "LIGHT"
+            zone_for_msg = z4
+            key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
+            if not STATE["sent"].get(key):
+                if tg_send_signal(symbol, sig_type, zone_for_msg):
+                    STATE["sent"][key] = int(time.time())
+                    STATE["sent"][gate_key] = 1
+                    return symbol
         return None
 
-    # 1TF+CAN — ровно один TF в зоне и на нём же есть паттерн
+    # === 1TF+CAN: ровно один TF в зоне и на нём же есть паттерн ===
     if (z4 is not None) ^ (z1 is not None):
         if z4 is not None and has_can_4:
             sig_type = "1TF+CAN"; zone_for_msg = z4; pat_tf = "4H"
-            key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
         elif z1 is not None and has_can_1:
             sig_type = "1TF+CAN"; zone_for_msg = z1; pat_tf = "1D"
-            key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
         else:
             return None
-
-        if STATE["sent"].get(key):
-            return None
-        if tg_send_signal(symbol, sig_type, zone_for_msg):
-            STATE["sent"][key] = int(time.time())
-            return symbol
+        key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
+        if not STATE["sent"].get(key):
+            if tg_send_signal(symbol, sig_type, zone_for_msg):
+                STATE["sent"][key] = int(time.time())
+                return symbol
         return None
 
     return None
