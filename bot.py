@@ -18,15 +18,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", ""))
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# публикация в приватную группу (оставляю как есть)
+# публикация в приватную группу
 GROUP_CHAT_ID  = "-1002963303214"
 
 DEBUG_TG       = os.getenv("DEBUG_TG", "0") == "1"
 DEBUG_SCAN     = os.getenv("DEBUG_SCAN", "0") == "1"
 SELFTEST_PING  = os.getenv("SELFTEST_PING", "0") == "1"
 
-# версия формата (для совместимости со state)
-FORMAT_VER     = os.getenv("FORMAT_VER", "v6")
+# формат ключей (для сброса истории при необходимости)
+FORMAT_VER     = os.getenv("FORMAT_VER", "v11")
 
 # ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
@@ -75,38 +75,77 @@ def save_state(path: str, data: Dict) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ SEED ============
+# ============ STATIC SEED (расширенный резерв) ============
 STATIC_SYMBOLS: List[str] = [
-    # crypto majors
-    "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT",
-    "TON-USDT","LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT",
-    # metals / indices
-    "XAU-USDT","XAG-USDT","US100","US500","US30","US2000","VIX",
-    # FX
-    "EUR-USD","GBP-USD","USD-JPY","AUD-USD","USD-CAD","USD-CHF",
-    # tokenized stocks (если доступны)
-    "TSLA-USDT","AAPL-USDT","NVDA-USDT","META-USDT","AMZN-USDT"
+    # === CRYPTO Majors / L1/L2 / DeFi (популярные PERP) ===
+    "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","ADA-USDT","DOGE-USDT","TON-USDT",
+    "LTC-USDT","TRX-USDT","LINK-USDT","DOT-USDT","AVAX-USDT","MATIC-USDT","OP-USDT","ARB-USDT",
+    "APT-USDT","ATOM-USDT","SUI-USDT","NEAR-USDT","ETC-USDT","BCH-USDT","ICP-USDT","FIL-USDT",
+    "AAVE-USDT","UNI-USDT","INJ-USDT","RUNE-USDT","XLM-USDT","ALGO-USDT","HBAR-USDT","FTM-USDT",
+    "GRT-USDT","PEPE-USDT","WIF-USDT","SEI-USDT","SUI-USDT","TIA-USDT","JUP-USDT","PYTH-USDT",
+
+    # === Privacy & Low-corr (если доступны на BingX) ===
+    "XMR-USDT","ZEC-USDT","DASH-USDT",
+
+    # === Stablecoin pairs (если есть perp) ===
+    "USDC-USDT","BUSD-USDT","TUSD-USDT","FDUSD-USDT","DAI-USDT","PYUSD-USDT","USDT-USD",
+
+    # === Metals ===
+    "XAU-USDT","XAG-USDT","XPT-USDT","XPD-USDT",
+
+    # === US & World Indices (токенизированные / индикативные фьючи) ===
+    "US100","US500","US30","US2000","VIX",
+    "DE40","DE30","UK100","JP225","FR40","HK50","ES35","IT40","AU200","CN50",
+
+    # === FOREX Majors & Minors ===
+    "EUR-USD","GBP-USD","USD-JPY","AUD-USD","NZD-USD","USD-CAD","USD-CHF",
+    "EUR-JPY","GBP-JPY","EUR-GBP","AUD-JPY","CHF-JPY","CAD-JPY","NZD-JPY",
+    "USD-MXN","USD-TRY","USD-CNH","USD-HKD","USD-SGD","USD-ZAR",
+
+    # === Tokenized Stocks (xStock), если доступны ===
+    "AAPL-USDT","MSFT-USDT","NVDA-USDT","GOOGL-USDT","AMZN-USDT","META-USDT","TSLA-USDT",
+    "BRK.B-USDT","JPM-USDT","V-USDT","MA-USDT","UNH-USDT","JNJ-USDT","PG-USDT","HD-USDT",
+    "NFLX-USDT","ADBE-USDT","AMD-USDT","CRM-USDT","AVGO-USDT","KO-USDT","PEP-USDT"
 ]
 
-# ============ SYMBOL RESOLVER ============
+# ============ SYMBOL NORMALIZATION ============
 def symbol_variants(sym: str) -> List[str]:
+    """Пробуем несколько алиасов для запроса klines."""
     v: List[str] = []
-    s = sym.upper()
+    s = sym.upper().replace("_","-")
     v.append(s)
+
+    # plain TICKER -> TICKER-USDT
     if "-" not in s and not s.endswith("-USDT"):
         v.append(f"{s}-USDT")
-    m = re.fullmatch(r"([A-Z]{3,4})USDT", s)
+
+    # XXXUSDT -> XXX-USDT
+    m = re.fullmatch(r"([A-Z0-9]{3,})USDT", s)
     if m:
         v.append(f"{m.group(1)}-USDT")
-    if s in ("XAU-USDT","XAUUSD"): v += ["XAUUSD","XAU-USDT"]
-    if s in ("XAG-USDT","XAGUSD"): v += ["XAGUSD","XAG-USDT"]
-    if s in ("US100","US500","US30","US2000","VIX"): v.append(f"{s}-USDT")
+
+    # Индексы часто есть без -USDT
+    if s in {"US100","US500","US30","US2000","VIX","DE40","DE30","UK100","JP225","FR40","HK50","ES35","IT40","AU200","CN50"}:
+        v.append(f"{s}-USDT")
+
+    # Металлы (спот алиасы)
+    if s in {"XAU","XAUUSD","XAU-USDT"}:
+        v += ["XAUUSD","XAU-USDT"]
+    if s in {"XAG","XAGUSD","XAG-USDT"}:
+        v += ["XAGUSD","XAG-USDT"]
+
+    # Уникализация
     seen=set(); out=[]
     for x in v:
         if x not in seen:
             out.append(x); seen.add(x)
     return out
 
+def normalize_from_contract(sym: str) -> str:
+    """Нормализуем символ из /contracts под привычные запросы klines."""
+    return sym.upper().replace("_","-")
+
+# ============ KLINES PARSER ============
 def _pick_num(d: Dict, *keys: str) -> Optional[float]:
     for k in keys:
         if k in d and d[k] is not None:
@@ -140,7 +179,8 @@ def _parse_klines_payload(raw) -> Optional[List[List[float]]]:
 def fetch_klines_once(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
     url = f"{BINGX_BASE}/openApi/swap/v3/quote/klines"
     data = http_get(url, params={"symbol": symbol, "interval": interval, "limit": str(limit)})
-    if not data: return None
+    if not data:
+        return None
     raw = data.get("data") or data.get("klines") or []
     return _parse_klines_payload(raw)
 
@@ -153,34 +193,38 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[
 
 # ============ SYMBOLS DISCOVERY ============
 def fetch_contracts_dynamic() -> List[str]:
+    """Тянем все PERP из BingX и нормализуем."""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/contracts"
     data = http_get(url, params={}) or {}
     items = data.get("data") or data.get("symbolList") or []
     out: List[str] = []
     for it in items:
         sym = (it.get("symbol") or it.get("contractId") or "").upper()
-        if not sym: continue
+        if not sym:
+            continue
         ctype = (it.get("contractType") or it.get("type") or "").upper()
-        if "PERP" not in ctype: continue
-        out.append(sym.upper())
+        if "PERP" not in ctype:
+            continue
+        out.append(normalize_from_contract(sym))
     return sorted(set(out))
 
-def validate_symbols(cands: List[str]) -> List[str]:
+def validate_symbols(cands: List[str], sample_tf: str = "1d") -> List[str]:
+    """Лёгкая валидация: у тикера должны быть хотя бы 2 бара на дневке."""
     valid: List[str] = []
     for s in cands:
         try:
-            k = fetch_klines(s, KLINE_1D, limit=5)
+            k = fetch_klines(s, sample_tf, limit=5)
             if k and len(k) >= 2:
                 valid.append(s)
         except Exception:
             pass
-        time.sleep(0.01)
+        time.sleep(0.005)
     return valid
 
 def get_symbols() -> List[str]:
     dyn = fetch_contracts_dynamic()
     universe = sorted(set(dyn) | set(STATIC_SYMBOLS))
-    valid = validate_symbols(universe)
+    valid = validate_symbols(universe, sample_tf=KLINE_1D)
     if valid:
         STATE["universe"] = valid
         save_state(STATE_PATH, STATE)
@@ -219,26 +263,29 @@ def last_closed_ts(ohlc: List[List[float]]) -> Optional[int]:
     if not ohlc or len(ohlc) < 2: return None
     return int(ohlc[-2][0])
 
-# ============ ZONES (СТРОГО: без округления) ============
+# ============ ZONES (СТРОГО, без округлений) ============
 def zone_of_closed(v: Optional[float]) -> Optional[str]:
     if v is None: return None
     if v >= DEM_OB: return "OB"
     if v <= DEM_OS: return "OS"
     return None
 
-# ============ CANDLE PATTERNS (закрытая свеча и только в зоне) ============
+# ============ CANDLE PATTERNS (строго по закрытой свече -2) ============
 def wick_ge_body_pct(ohlc: List[List[float]], idx: int, pct: float = 0.25) -> bool:
-    """Любой фитиль >= pct от ТЕЛА свечи (верхний или нижний)."""
+    """Pin-bar: любой фитиль >= pct * |тело| на закрытой свече."""
     if not ohlc or not (-len(ohlc) <= idx < len(ohlc)):
         return False
     o,h,l,c = ohlc[idx][1], ohlc[idx][2], ohlc[idx][3], ohlc[idx][4]
-    body = max(abs(c - o), 1e-12)
+    body = abs(c - o)
+    if body <= 1e-12:
+        return False
     upper = h - max(o, c)
     lower = min(o, c) - l
     thr = pct * body
     return (upper >= thr) or (lower >= thr)
 
 def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -> bool:
+    """Engulfing на закрытой свече -2 + ≥2 свечи противоположного цвета до неё."""
     need = (-base_idx) + 3
     if len(ohlc) < need or not (-len(ohlc) <= base_idx-3 < len(ohlc)):
         return False
@@ -256,10 +303,11 @@ def engulfing_with_prior_opposition_at(ohlc: List[List[float]], base_idx: int) -
         if not (bull2 and bull3): return False
         return (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
-def candle_pattern_ok_closed_if_zone(ohlc: List[List[float]], zone_exists: bool) -> bool:
-    if not zone_exists or not ohlc or len(ohlc) < 4:
+def candle_pattern_on_closed(ohlc: List[List[float]]) -> bool:
+    """Проверяем паттерн только на закрытой свече (-2)."""
+    if not ohlc or len(ohlc) < 4:  # нужно достаточно истории для engulfing
         return False
-    base_idx = -2  # строго закрытая свеча
+    base_idx = -2
     return wick_ge_body_pct(ohlc, base_idx, 0.25) or engulfing_with_prior_opposition_at(ohlc, base_idx)
 
 # ============ SIGNAL UTILS ============
@@ -297,11 +345,12 @@ def tg_send_raw(text: str) -> bool:
 def tg_send_signal(symbol: str, signal_type: str, zone: Optional[str]) -> bool:
     return tg_send_raw(format_signal_text(symbol, signal_type, zone))
 
-# ============ CORE ============
+# ===== DEDUP KEYS: один сигнал каждого типа на пару закрытых баров =====
 def build_dedup_key(symbol: str, signal_type: str, zone: Optional[str],
                     ts_1d: int, ts_4h: int, pat_tf: str = "-") -> str:
     return f"{FORMAT_VER}|{symbol}|{signal_type}|{zone or '-'}|{ts_1d}|{ts_4h}|{pat_tf}"
 
+# ============ CORE ============
 def process_symbol(symbol: str) -> Optional[str]:
     k4 = fetch_klines(symbol, KLINE_4H, limit=max(200, DEM_LEN + 10))
     k1 = fetch_klines(symbol, KLINE_1D, limit=max(200, DEM_LEN + 10))
@@ -318,31 +367,25 @@ def process_symbol(symbol: str) -> Optional[str]:
     z4 = zone_of_closed(dem4)
     z1 = zone_of_closed(dem1)
 
-    has_can_4 = candle_pattern_ok_closed_if_zone(k4, z4 is not None)
-    has_can_1 = candle_pattern_ok_closed_if_zone(k1, z1 is not None)
-
     ts4 = last_closed_ts(k4)
     ts1 = last_closed_ts(k1)
     if ts4 is None or ts1 is None:
         return None
 
+    # DEBUG строка (без форматных ошибок)
     if DEBUG_SCAN:
-        dprint(f"{symbol} dem1={dem1:.4f if dem1 is not None else float('nan')} z1={z1} "
-               f"dem4={dem4:.4f if dem4 is not None else float('nan')} z4={z4} "
-               f"pat1D={has_can_1} pat4H={has_can_4} ts1={ts1} ts4={ts4}")
-
-    sig_type: Optional[str] = None
-    zone_for_msg: Optional[str] = None
-    pat_tf = "-"
+        s_dem1 = "nan" if dem1 is None else f"{dem1:.4f}"
+        s_dem4 = "nan" if dem4 is None else f"{dem4:.4f}"
+        dprint(f"{symbol} dem1={s_dem1} z1={z1} dem4={s_dem4} z4={z4} ts1={ts1} ts4={ts4}")
 
     # === МОЛНИЯ: обе закрытые свечи в одной зоне (OB или OS) ===
     if (z4 is not None) and (z1 is not None) and (z4 == z1):
+        has_can_4 = candle_pattern_on_closed(k4)
+        has_can_1 = candle_pattern_on_closed(k1)
         if has_can_4 or has_can_1:
-            sig_type = "L+CAN"
-            pat_tf = "4H" if has_can_4 else "1D"
+            sig_type = "L+CAN"; zone_for_msg = z4; pat_tf = "4H" if has_can_4 else "1D"
         else:
-            sig_type = "LIGHT"
-        zone_for_msg = z4
+            sig_type = "LIGHT"; zone_for_msg = z4; pat_tf = "-"
         key = build_dedup_key(symbol, sig_type, zone_for_msg, ts1, ts4, pat_tf)
         if not STATE["sent"].get(key):
             if tg_send_signal(symbol, sig_type, zone_for_msg):
@@ -350,11 +393,13 @@ def process_symbol(symbol: str) -> Optional[str]:
                 return symbol
         return None
 
-    # === 1TF+CAN: Ровно один TF в зоне и на нём есть паттерн ===
+    # === 1TF+CAN: ровно один TF в зоне и на нём есть паттерн (без молнии) ===
     if (z4 is not None) ^ (z1 is not None):
-        if (z4 is not None) and has_can_4:
+        has_can_4 = candle_pattern_on_closed(k4) if z4 is not None else False
+        has_can_1 = candle_pattern_on_closed(k1) if z1 is not None else False
+        if z4 is not None and has_can_4:
             sig_type = "1TF+CAN"; zone_for_msg = z4; pat_tf = "4H"
-        elif (z1 is not None) and has_can_1:
+        elif z1 is not None and has_can_1:
             sig_type = "1TF+CAN"; zone_for_msg = z1; pat_tf = "1D"
         else:
             return None
