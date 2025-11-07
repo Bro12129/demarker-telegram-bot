@@ -1,17 +1,17 @@
-# bot.py — DeMarker 28h (жёсткий фикс отправки в группы/каналы)
+# bot.py — DeMarker 28h (пер-чатовый антидубль + мульти-чаты + логи)
 import os, time, json, logging, requests
 from typing import List, Dict, Optional
 
 # ============ CONFIG ============
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")  # "-100...,@mychannel,123456789"
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")  # можно несколько через запятую
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 DEM_LEN  = 28
 DEM_OB   = 0.70
 DEM_OS   = 0.30
-POLL_SECONDS = 60  # диагностика
+POLL_SECONDS = 60  # для оперативной проверки
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
 log = logging.getLogger("bot")
@@ -22,7 +22,7 @@ def load_state(path: str) -> Dict:
         with open(path, "r") as f:
             return json.load(f)
     except Exception:
-        return {"sent": {}}
+        return {"sent": {}}  # будем хранить ключи вида "<signal_key>|<chat_id>": ts
 
 def save_state(path: str, data: Dict) -> None:
     try:
@@ -43,93 +43,56 @@ def _chat_tokens() -> List[str]:
         return []
     return [x.strip() for x in raw.split(",") if x.strip()]
 
-def _resolve_username(u: str) -> Optional[int]:
-    """@username -> numeric chat_id через getChat"""
+def _tg_post_json(path: str, payload: dict):
     try:
-        r = requests.get(f"{TG_API}/getChat", params={"chat_id": u}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("ok") and "result" in data:
-                cid = data["result"]["id"]
-                log.info(f"TG resolve {u} -> {cid}")
-                return int(cid)
-            else:
-                log.info(f"TG resolve fail {u}: {data}")
-        else:
-            log.info(f"TG resolve HTTP {u}: {r.status_code} {r.text}")
+        return requests.post(f"{TG_API}/{path}", json=payload, timeout=10)
     except Exception as e:
-        log.info(f"TG resolve exception {u}: {e}")
-    return None
+        class Dummy: status_code=0; text=str(e)
+        return Dummy()
 
-def _expanded_chat_ids() -> List[str]:
-    """Вернёт список chat_id (numeric в строке) — @username будут развёрнуты в числа"""
-    out: List[str] = []
-    for tok in _chat_tokens():
-        if tok.startswith("@"):
-            cid = _resolve_username(tok)
-            if cid is not None:
-                out.append(str(cid))
-            else:
-                # оставим как есть — Telegram иногда принимает @username напрямую
-                out.append(tok)
-        else:
-            out.append(tok)
-    # уникализируем порядок
-    seen = set(); res=[]
-    for x in out:
-        if x not in seen:
-            seen.add(x); res.append(x)
-    return res
+def _tg_post_form(path: str, payload: dict):
+    try:
+        return requests.post(f"{TG_API}/{path}", data=payload, timeout=10)
+    except Exception as e:
+        class Dummy: status_code=0; text=str(e)
+        return Dummy()
 
-def _tg_send_one_json(cid: str, text: str) -> requests.Response:
-    return requests.post(
-        f"{TG_API}/sendMessage",
-        json={"chat_id": cid, "text": text},  # без disable_notification на всякий
-        timeout=10
-    )
+def tg_send_one(cid: str, text: str) -> bool:
+    """Отправка в один конкретный chat_id, с дублем JSON→FORM. Возвращает True при успехе."""
+    r = _tg_post_json("sendMessage", {"chat_id": cid, "text": text})
+    ok = False
+    try:
+        j = r.json(); ok = bool(j.get("ok"))
+    except Exception:
+        j = {"ok": False, "error": r.text}
+    if ok:
+        log.info(f"TG ok -> {cid}")
+        return True
+    log.info(f"TG error JSON [{cid}]: {r.status_code} {j}")
 
-def _tg_send_one_form(cid: str, text: str) -> requests.Response:
-    return requests.post(
-        f"{TG_API}/sendMessage",
-        data={"chat_id": cid, "text": text},
-        timeout=10
-    )
+    r2 = _tg_post_form("sendMessage", {"chat_id": cid, "text": text})
+    try:
+        j2 = r2.json(); ok2 = bool(j2.get("ok"))
+    except Exception:
+        j2 = {"ok": False, "error": r2.text}; ok2 = False
+    if ok2:
+        log.info(f"TG ok (form) -> {cid}")
+    else:
+        log.info(f"TG error FORM [{cid}]: {r2.status_code} {j2}")
+    return ok2
 
-def tg_send_raw(text: str):
+def tg_send_all(text: str):
+    """Рассылка сервисных сообщений во ВСЕ chat_id без антидубля (пинги/инфо)."""
     if not TELEGRAM_TOKEN:
-        log.info("TG skipped: missing TELEGRAM_BOT_TOKEN")
-        return
-    chats = _expanded_chat_ids()
+        log.info("TG skipped: missing TELEGRAM_BOT_TOKEN"); return
+    chats = _chat_tokens()
     if not chats:
-        log.info("TG skipped: missing TELEGRAM_CHAT_ID")
-        return
+        log.info("TG skipped: missing TELEGRAM_CHAT_ID"); return
     for cid in chats:
-        ok = False
-        try:
-            r = _tg_send_one_json(cid, text)
-            if r.status_code == 200 and r.json().get("ok"):
-                log.info(f"TG ok -> {cid}")
-                ok = True
-            else:
-                log.info(f"TG error JSON [{cid}]: {r.status_code} {r.text}")
-        except Exception as e:
-            log.info(f"TG exception JSON [{cid}]: {e}")
-        if not ok:
-            try:
-                r2 = _tg_send_one_form(cid, text)
-                if r2.status_code == 200 and r2.json().get("ok"):
-                    log.info(f"TG ok (form) -> {cid}")
-                    ok = True
-                else:
-                    log.info(f"TG error FORM [{cid}]: {r2.status_code} {r2.text}")
-            except Exception as e2:
-                log.info(f"TG exception FORM [{cid}]: {e2}")
+        tg_send_one(cid, text)
 
 def tg_ping(msg="💰 Нагибатор-достигатор активен. Генератор бабла запущен!"):
-    try:
-        tg_send_raw(msg)
-    except Exception as e:
-        log.info(f"TG ping failed: {e}")
+    tg_send_all(msg)
 
 # ============ SYMBOLS ============
 YF_SYMBOLS = [
@@ -243,15 +206,31 @@ def engulfing_with_prior(ohlc, idx):
     o2,c2 = ohlc[idx-2][1], ohlc[idx-2][4]; o3,c3 = ohlc[idx-3][1], ohlc[idx-3][4]
     bull0 = c0 >= o0; bull2 = c2 >= o2; bull3 = c3 >= o3
     if bull0:
-        return (not bull2 and not bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
+        return (not bull2 и not bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
     else:
-        return (bull2 and bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
+        return (bull2 и bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
 def candle_pattern(ohlc):
     if not ohlc or len(ohlc) < 4: return False
     return wick_ge_body_pct(ohlc, -2, 0.25) or engulfing_with_prior(ohlc, -2)
 
 # ============ CORE ============
+def _broadcast_signal(text: str, signal_key: str) -> bool:
+    """Шлём сигнал в каждый chat_id, отмечаем антидубль по ключу + chat_id."""
+    chats = _chat_tokens()
+    if not TELEGRAM_TOKEN or not chats:
+        return False
+    sent_any = False
+    ts_now = int(time.time())
+    for cid in chats:
+        k2 = f"{signal_key}|{cid}"
+        if STATE["sent"].get(k2):
+            continue
+        if tg_send_one(cid, text):
+            STATE["sent"][k2] = ts_now
+            sent_any = True
+    return sent_any
+
 def process_symbol(sym: str) -> bool:
     triggered = False
     try:
@@ -264,36 +243,34 @@ def process_symbol(sym: str) -> bool:
 
         if (z4 and z1 and z4 == z1):
             sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
-            key = f"{sym}|{sig}|{z4}|{k1[-2][0]}"
-            if not STATE["sent"].get(key):
-                tg_send_raw(format_signal(norm_name(sym), sig, z4))
-                STATE["sent"][key] = int(time.time())
+            base_key = f"{sym}|{sig}|{z4}|{k1[-2][0]}"
+            if _broadcast_signal(format_signal(norm_name(sym), sig, z4), base_key):
                 triggered = True
         elif (z4 and not z1) or (z1 and not z4):
             if z4 and candle_pattern(k4): z, tf = z4, "4H"
             elif z1 and candle_pattern(k1): z, tf = z1, "1D"
             else: return False
-            key = f"{sym}|1TF+CAN|{z}|{tf}|{k1[-2][0]}"
-            if not STATE["sent"].get(key):
-                tg_send_raw(format_signal(norm_name(sym), "1TF+CAN", z))
-                STATE["sent"][key] = int(time.time())
+            base_key = f"{sym}|1TF+CAN|{z}|{tf}|{k1[-2][0]}"
+            if _broadcast_signal(format_signal(norm_name(sym), "1TF+CAN", z), base_key):
                 triggered = True
     except Exception as e:
         log.info(f"ERR {sym}: {e}")
     return triggered
 
 def main():
-    tg_ping()  # 💰 Нагибатор-достигатор активен. Генератор бабла запущен!
+    # покажем какие chat_id реально читаются
+    log.info(f"Chats: {','.join(_chat_tokens()) or '—'}")
+    tg_ping()  # сервисный пинг в каждый чат
     log.info(f"INFO: Scan start — {len(YF_SYMBOLS)} symbols, interval {POLL_SECONDS}s.")
     while True:
-        total_signals = 0
+        total = 0
         for s in YF_SYMBOLS:
-            if process_symbol(s): total_signals += 1
+            if process_symbol(s): total += 1
             time.sleep(1)
         save_state(STATE_PATH, STATE)
-        log.info(f"Cycle done. Signals: {total_signals}. Sleeping {POLL_SECONDS}s.")
-        if total_signals == 0:
-            tg_send_raw("ℹ️ Пока тишина — бабло в засаде 💤")
+        log.info(f"Cycle done. Signals: {total}. Sleeping {POLL_SECONDS}s.")
+        if total == 0:
+            tg_send_all("ℹ️ Пока тишина — бабло в засаде 💤")
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
