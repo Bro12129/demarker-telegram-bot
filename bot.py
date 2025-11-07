@@ -1,11 +1,11 @@
-# bot.py — версия DeMarker 28h (фикс уведомлений + логов)
+# bot.py — DeMarker 28h (мульти-чаты + фикс уведомлений/логов)
 import os, time, json, logging, requests
 from typing import List, Dict, Optional
 
 # ============ CONFIG ============
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")  # можно: "-1001234567890,@mychannel,123456789"
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 DEM_LEN  = 28
@@ -36,21 +36,39 @@ def save_state(path: str, data: Dict) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ TELEGRAM ============
+# ============ TG HELPERS ============
+def _chat_ids() -> List[str]:
+    """
+    Поддержка нескольких получателей:
+    TELEGRAM_CHAT_ID="-100123...,@mychannel,123456789"
+    Допускается numeric (с минусом для супергрупп/каналов) и @username каналов.
+    """
+    raw = (TELEGRAM_CHAT or "").strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
 def tg_send_raw(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        log.info("TG skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    if not TELEGRAM_TOKEN:
+        log.info("TG skipped: missing TELEGRAM_BOT_TOKEN")
         return
-    try:
-        r = requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT, "text": text, "disable_notification": True},
-            timeout=10
-        )
-        if r.status_code != 200:
-            log.info(f"TG error: {r.text}")
-    except Exception as e:
-        log.info(f"TG exception: {e}")
+    chats = _chat_ids()
+    if not chats:
+        log.info("TG skipped: missing TELEGRAM_CHAT_ID")
+        return
+    for cid in chats:
+        try:
+            r = requests.post(
+                f"{TG_API}/sendMessage",
+                json={"chat_id": cid, "text": text, "disable_notification": True},
+                timeout=10
+            )
+            if r.status_code != 200:
+                log.info(f"TG error [{cid}]: {r.status_code} {r.text}")
+            else:
+                log.info(f"TG ok -> {cid}")
+        except Exception as e:
+            log.info(f"TG exception [{cid}]: {e}")
 
 def tg_ping(msg="💰 Нагибатор-достигатор активен. Генератор бабла запущен!"):
     try:
@@ -63,7 +81,7 @@ YF_SYMBOLS = [
     # === CRYPTO ===
     "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","DOGE-USD","AVAX-USD","DOT-USD","LINK-USD",
     "LTC-USD","MATIC-USD","TON-USD","ATOM-USD","NEAR-USD","FIL-USD","AAVE-USD","XMR-USD","LDO-USD","INJ-USD",
-    "APT-USD","SUI-USD","ARB-USD","OP-USD","PEPE-USD","SHIB-USD",
+    "APT-USD","SUI-USD","ARB-USD","OP-USD","PЕPE-USD","SHIB-USD".replace("PЕ","PE"),  # страховка от кириллицы в тикере
     # === COMMODITIES ===
     "GC=F","SI=F","CL=F","NG=F","HG=F","PL=F","PA=F",
     # === FX ===
@@ -88,8 +106,7 @@ def norm_name(sym: str) -> str:
     if sym in INDEX_MAP: return INDEX_MAP[sym]
     if sym in COMMO_MAP: return COMMO_MAP[sym]
     if sym.endswith("=X") and len(sym) >= 7:
-        pair = sym[:-2]
-        base, quote = pair[:3], pair[3:]
+        pair = sym[:-2]; base, quote = pair[:3], pair[3:]
         return f"{base}-{quote}".upper()
     s = sym.replace("^","")
     if s.endswith("-USD"): return s[:-4] + "-USDT"
@@ -212,7 +229,7 @@ def process_symbol(sym: str) -> bool:
 
 def main():
     tg_ping()  # 💰 Нагибатор-достигатор активен. Генератор бабла запущен!
-    log.info(f"INFO: Scan start — {len(YF_SYMBOLS)} symbols, interval 60s.")
+    log.info(f"INFO: Scan start — {len(YF_SYMBOLS)} symbols, interval {POLL_SECONDS}s.")
     while True:
         total_signals = 0
         for s in YF_SYMBOLS:
