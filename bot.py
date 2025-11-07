@@ -1,17 +1,20 @@
-# bot.py — DeMarker 28h (пер-чатовый антидубль + мульти-чаты + логи)
+# bot.py — DeMarker 28h (только группа, пер-чатовый антидубль, логи)
 import os, time, json, logging, requests
 from typing import List, Dict, Optional
 
 # ============ CONFIG ============
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")  # можно несколько через запятую
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 DEM_LEN  = 28
 DEM_OB   = 0.70
 DEM_OS   = 0.30
-POLL_SECONDS = 60  # для оперативной проверки
+POLL_SECONDS = 60  # проверка каждую минуту
+
+# только группа: если 1 — бот игнорирует личные ID
+TELEGRAM_GROUP_ONLY = os.getenv("TELEGRAM_GROUP_ONLY", "1") in ("1", "true", "yes")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
 log = logging.getLogger("bot")
@@ -22,7 +25,7 @@ def load_state(path: str) -> Dict:
         with open(path, "r") as f:
             return json.load(f)
     except Exception:
-        return {"sent": {}}  # будем хранить ключи вида "<signal_key>|<chat_id>": ts
+        return {"sent": {}}
 
 def save_state(path: str, data: Dict) -> None:
     try:
@@ -41,7 +44,10 @@ def _chat_tokens() -> List[str]:
     raw = (TELEGRAM_CHAT or "").strip()
     if not raw:
         return []
-    return [x.strip() for x in raw.split(",") if x.strip()]
+    toks = [x.strip() for x in raw.split(",") if x.strip()]
+    if TELEGRAM_GROUP_ONLY:
+        toks = [t for t in toks if (t.startswith("-100") or (t.startswith("-") and t[1:].isdigit()))]
+    return toks
 
 def _tg_post_json(path: str, payload: dict):
     try:
@@ -58,7 +64,6 @@ def _tg_post_form(path: str, payload: dict):
         return Dummy()
 
 def tg_send_one(cid: str, text: str) -> bool:
-    """Отправка в один конкретный chat_id, с дублем JSON→FORM. Возвращает True при успехе."""
     r = _tg_post_json("sendMessage", {"chat_id": cid, "text": text})
     ok = False
     try:
@@ -82,10 +87,9 @@ def tg_send_one(cid: str, text: str) -> bool:
     return ok2
 
 def tg_send_all(text: str):
-    """Рассылка сервисных сообщений во ВСЕ chat_id без антидубля (пинги/инфо)."""
+    chats = _chat_tokens()
     if not TELEGRAM_TOKEN:
         log.info("TG skipped: missing TELEGRAM_BOT_TOKEN"); return
-    chats = _chat_tokens()
     if not chats:
         log.info("TG skipped: missing TELEGRAM_CHAT_ID"); return
     for cid in chats:
@@ -206,9 +210,9 @@ def engulfing_with_prior(ohlc, idx):
     o2,c2 = ohlc[idx-2][1], ohlc[idx-2][4]; o3,c3 = ohlc[idx-3][1], ohlc[idx-3][4]
     bull0 = c0 >= o0; bull2 = c2 >= o2; bull3 = c3 >= o3
     if bull0:
-        return (not bull2 и not bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
+        return (not bull2 and not bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
     else:
-        return (bull2 и bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
+        return (bull2 and bull3) and (min(o0,c0) <= min(o1,c1)) and (max(o0,c0) >= max(o1,c1))
 
 def candle_pattern(ohlc):
     if not ohlc or len(ohlc) < 4: return False
@@ -216,7 +220,6 @@ def candle_pattern(ohlc):
 
 # ============ CORE ============
 def _broadcast_signal(text: str, signal_key: str) -> bool:
-    """Шлём сигнал в каждый chat_id, отмечаем антидубль по ключу + chat_id."""
     chats = _chat_tokens()
     if not TELEGRAM_TOKEN or not chats:
         return False
@@ -258,9 +261,8 @@ def process_symbol(sym: str) -> bool:
     return triggered
 
 def main():
-    # покажем какие chat_id реально читаются
-    log.info(f"Chats: {','.join(_chat_tokens()) or '—'}")
-    tg_ping()  # сервисный пинг в каждый чат
+    log.info(f"Chats (group-only={TELEGRAM_GROUP_ONLY}): {','.join(_chat_tokens()) or '—'}")
+    tg_ping()
     log.info(f"INFO: Scan start — {len(YF_SYMBOLS)} symbols, interval {POLL_SECONDS}s.")
     while True:
         total = 0
