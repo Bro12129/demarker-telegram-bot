@@ -1,13 +1,12 @@
 # bot.py — DeMarker-28h Yahoo Edition (futures + crypto + US + RU + indices)
 # clean: only signals, no logs, group-only, 60-minute polling
-
 import os, time, json, requests
 from typing import List, Dict, Optional
 
 # ============ CONFIG ============
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")   # -100...
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")   # -100..., можно через запятую
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 DEM_LEN  = 28
@@ -36,6 +35,18 @@ def save_state(path: str, data: Dict) -> None:
     except Exception:
         pass
 
+def gc_state(state: Dict, days: int = 21) -> None:
+    """Удаляем ключи старше N дней (по времени отправки)."""
+    try:
+        cutoff = int(time.time()) - days*86400
+        sent = state.get("sent", {})
+        for k in list(sent.keys()):
+            if isinstance(sent[k], int) and sent[k] < cutoff:
+                del sent[k]
+        state["sent"] = sent
+    except Exception:
+        pass
+
 STATE = load_state(STATE_PATH)
 
 # ============ TELEGRAM ============
@@ -44,7 +55,11 @@ def _chat_tokens() -> List[str]:
     if not raw:
         return []
     toks = [x.strip() for x in raw.split(",") if x.strip()]
+    # Разрешаем только отрицательные chat_id (частные чаты/группы).
     toks = [t for t in toks if (t.startswith("-100") or (t.startswith("-") and t[1:].isdigit()))]
+    # Если включён "только группы" — пропускаем только -100...
+    if TELEGRAM_GROUP_ONLY:
+        toks = [t for t in toks if t.startswith("-100")]
     return toks
 
 def tg_send_one(cid: str, text: str) -> bool:
@@ -55,6 +70,11 @@ def tg_send_one(cid: str, text: str) -> bool:
         return False
 
 def _broadcast_signal(text: str, signal_key: str) -> bool:
+    """
+    Дедупликация делается НА УРОВНЕ ключа signal_key.
+    Здесь дополнительно учитываем chat_id, чтобы один и тот же сигнал
+    не улетал повторно в один и тот же чат в рамках того же бара.
+    """
     chats = _chat_tokens()
     if not TELEGRAM_TOKEN or not chats:
         return False
@@ -71,7 +91,8 @@ def _broadcast_signal(text: str, signal_key: str) -> bool:
 
 # ============ INDICATORS ============
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
-    if not ohlc or len(ohlc) < length + 2: return None
+    if not ohlc or len(ohlc) < length + 2:
+        return None
     highs=[x[2] for x in ohlc]; lows=[x[3] for x in ohlc]
     up=[0.0]; dn=[0.0]
     for i in range(1,len(ohlc)):
@@ -168,7 +189,8 @@ def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional
                 o=float(opens[i]); h=float(highs[i]); l=float(lows[i]); c=float(closes[i])
                 if h<=0 or l<=0: continue
                 out.append([int(ts[i]),o,h,l,c])
-            except Exception: continue
+            except Exception: 
+                continue
         return out if out else None
     except Exception:
         return None
@@ -176,22 +198,39 @@ def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional
 # ============ CORE ============
 def process_symbol(sym: str) -> bool:
     try:
-        k4=fetch_yahoo_klines(sym,"4h"); k1=fetch_yahoo_klines(sym,"1d")
-        if not k4 or not k1: return False
-        d4=demarker_series(k4,DEM_LEN); d1=demarker_series(k1,DEM_LEN)
-        if not d4 or not d1: return False
-        v4=last_closed(d4); v1=last_closed(d1)
-        z4=zone_of(v4); z1=zone_of(v1)
-        if (z4 and z1 and z4==z1):
-            sig="L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
-            key=f"{sym}|{sig}|{z4}|{k1[-2][0]}"
-            return _broadcast_signal(format_signal(sym,sig,z4),key)
-        elif (z4 and not z1) or (z1 and not z4):
-            if z4 and candle_pattern(k4): z,tf=z4,"4H"
-            elif z1 and candle_pattern(k1): z,tf=z1,"1D"
-            else: return False
-            key=f"{sym}|1TF+CAN|{z}|{tf}|{k1[-2][0]}"
-            return _broadcast_signal(format_signal(sym,"1TF+CAN",z),key)
+        k4 = fetch_yahoo_klines(sym,"4h")
+        k1 = fetch_yahoo_klines(sym,"1d")
+        if not k4 or not k1: 
+            return False
+
+        d4 = demarker_series(k4, DEM_LEN)
+        d1 = demarker_series(k1, DEM_LEN)
+        if not d4 or not d1: 
+            return False
+
+        v4 = last_closed(d4); v1 = last_closed(d1)
+        z4 = zone_of(v4);   z1 = zone_of(v1)
+
+        # open time последних ЗАКРЫТЫХ баров
+        open4 = k4[-2][0]
+        open1 = k1[-2][0]
+        dual_bar_id = max(open4, open1)  # повтор, когда закрывается новый бар на любом ТФ
+
+        # --- LIGHT / L+CAN: обе DeM в одной зоне
+        if z4 and z1 and z4 == z1:
+            sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+            key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
+            return _broadcast_signal(format_signal(sym, sig, z4), key)
+
+        # --- 1TF+CAN: только один ТФ в зоне и есть свечной на этом ТФ
+        if z4 and not z1 and candle_pattern(k4):
+            key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
+            return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+
+        if z1 and not z4 and candle_pattern(k1):
+            key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
+            return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+
         return False
     except Exception:
         return False
@@ -201,8 +240,9 @@ def main():
         for s in YF_SYMBOLS:
             process_symbol(s)
             time.sleep(1)
-        save_state(STATE_PATH,STATE)
+        gc_state(STATE, 21)
+        save_state(STATE_PATH, STATE)
         time.sleep(POLL_SECONDS)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
