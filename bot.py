@@ -1,8 +1,6 @@
-# bot.py — DeMarker-28h (Bybit → Yahoo, USDT display, group-only)
-# Источник 1: Bybit (linear+inverse). Источник 2: Yahoo fallback.
-# Только сигналы, без логов. Пулл раз в POLL_HOURS.
+# bot.py — DeMarker-28h (Bybit→Yahoo, 15 crypto majors, USDT display, group-only)
 
-import os, time, json, requests, re
+import os, time, json, requests
 from typing import List, Dict, Optional, Tuple, Set
 
 # ============ CONFIG ============
@@ -19,6 +17,8 @@ KLINE_4H   = os.getenv("KLINE_4H", "4h")
 KLINE_1D   = os.getenv("KLINE_1D", "1d")
 POLL_HOURS = int(os.getenv("POLL_HOURS", "1"))
 POLL_SECONDS = POLL_HOURS * 3600
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ============ STATE ============
 def load_state(path: str) -> Dict:
@@ -51,15 +51,13 @@ def gc_state(state: Dict, days: int = 21) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ TELEGRAM ============
+# ============ TELEGRAM (только группы -100…) ============
 def _chat_tokens() -> List[str]:
-    """Жёстко только групповые -100…  Любые другие ID игнорируются."""
     raw = (TELEGRAM_CHAT or "").strip()
     if not raw:
         return []
     toks = [x.strip() for x in raw.split(",") if x.strip()]
-    toks = [t for t in toks if t.startswith("-100")]
-    return toks
+    return [t for t in toks if t.startswith("-100")]
 
 def tg_send_one(cid: str, text: str) -> bool:
     try:
@@ -133,15 +131,20 @@ def candle_pattern(ohlc):
     return wick_ge_body_pct(ohlc,-2,0.25) or engulfing_with_prior(ohlc,-2)
 
 # ============ SOURCES ============
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-# --- Bybit (PERP: crypto + indices/commodities/FX/token-stocks) ---
 BYBIT_BASE   = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
 BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT   = 15
+
 _BB_LINEAR: Set[str] = set()
 _BB_INVERSE: Set[str] = set()
+
+# 15 популярных крипто-пар (Bybit symbols)
+ALLOWED_CRYPTO: Set[str] = {
+    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
+    "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT",
+    "LTCUSDT","MATICUSDT","TONUSDT","TRXUSDT","SHIBUSDT"
+}
 
 def refresh_bybit_instruments():
     global _BB_LINEAR, _BB_INVERSE
@@ -162,7 +165,6 @@ def refresh_bybit_instruments():
         return
 
 def fetch_bybit_klines(symbol_bb: str, interval: str, category_hint: Optional[str]=None, limit: int = 600) -> Optional[List[List[float]]]:
-    # Bybit intervals: 240 for 4h, D for 1d
     iv = "240" if interval == "4h" else ("D" if interval.lower() == "1d" else interval)
     cats = [category_hint] if category_hint in ("linear","inverse") else ["linear","inverse"]
     try:
@@ -176,7 +178,7 @@ def fetch_bybit_klines(symbol_bb: str, interval: str, category_hint: Optional[st
                 continue
             out=[]
             for k in lst:
-                ts = int(k[0]); 
+                ts = int(k[0])
                 if ts > 10**12: ts //= 1000
                 o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4])
                 if h<=0 or l<=0: continue
@@ -187,7 +189,6 @@ def fetch_bybit_klines(symbol_bb: str, interval: str, category_hint: Optional[st
     except Exception:
         return None
 
-# --- Yahoo (fallback) ---
 def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": interval, "range": "180d"}
@@ -216,7 +217,7 @@ def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional
     except Exception:
         return None
 
-# ============ ALIASES (YF/фьючерс → Bybit) ============
+# ============ АЛИАСЫ (индексы/металлы/FX/акции → Bybit) ============
 _ALIAS_TO_BB = {
     # Индексы США
     "ES":"US500USDT","NQ":"US100USDT","YM":"US30USDT","RTY":"US2000USDT",
@@ -228,23 +229,21 @@ _ALIAS_TO_BB = {
     # Металлы / Энергия
     "GC":"XAUUSDT","SI":"XAGUSDT","HG":"XCUUSDT","PL":"XPTUSDT","PA":"XPDUSDT",
     "CL":"OILUSDT","BZ":"BRENTUSDT","NG":"GASUSDT",
-    # FX (если есть на Bybit как перпы)
+    # FX (если есть как перпы)
     "EURUSD":"EURUSD","GBPUSD":"GBPUSD","USDJPY":"USDJPY","AUDUSD":"AUDUSD","NZDUSD":"NZDUSD",
-    "USDCAD":"USDCAD","USDCHF":"USDCHF"
+    "USDCAD":"USDCAD","USDCHF":"USDCHF",
 }
 
 def bb_from_other(sym: str) -> Optional[str]:
-    """Map Yahoo/фьючерс/индекс/акция в Bybit-символ, если существует."""
     s = (sym or "").upper().strip().replace(" ", "")
     s = s.replace("=F","").replace("=X","").lstrip("^")
     if s in _ALIAS_TO_BB:
         return _ALIAS_TO_BB[s]
-    # фьючерсные шорткоды → индексы
     idx_map = {"ES":"US500USDT","NQ":"US100USDT","YM":"US30USDT","RTY":"US2000USDT","DX":"DXYUSDT","VIX":"VIXUSDT",
                "GSPC":"US500USDT","NDX":"US100USDT","DJI":"US30USDT","RUT":"US2000USDT"}
     if s in idx_map:
         return idx_map[s]
-    # акции: AAPL → AAPLUSDT (если есть токен-акция у Bybit)
+    # акции: AAPL → AAPLUSDT (если есть токен на Bybit)
     if s.isalpha() and 1 < len(s) <= 6:
         return s + "USDT"
     return None
@@ -256,56 +255,40 @@ def _is_bybit_symbol(sym: str) -> bool:
 
 def fetch_klines(sym: str, interval: str) -> Tuple[Optional[List[List[float]]], Optional[str]]:
     """
-    Порядок: Bybit → Yahoo.
-    Возврат: (klines, src) где src ∈ {"BB","YF",None}
+    Порядок: Bybit → Yahoo. Возврат: (klines, src) где src ∈ {"BB","YF",None}
     """
     su = (sym or "").upper().strip()
 
-    # 1) Если уже Bybit-символ
+    # Уже Bybit-символ
     if _is_bybit_symbol(su):
         data = fetch_bybit_klines(su, interval)
         if data: return data, "BB"
-        # последний шанс: прокси в Yahoo
+        # последний шанс — прокси имя в Yahoo (AAPLUSDT→AAPL-USD, US500USDT→US500-USD)
         yproxy = su.replace("USDT","-USD")
         data = fetch_yahoo_klines(yproxy, interval)
         if data: return data, "YF"
         return None, None
 
-    # 2) Попробовать замапить в Bybit через алиасы/эвристику
+    # Пробуем замапить в Bybit через алиас
     bb = bb_from_other(su)
     if bb and _is_bybit_symbol(bb):
         data = fetch_bybit_klines(bb, interval)
         if data: return data, "BB"
 
-    # 3) Yahoo fallback по исходному имени (YF-стиль)
+    # Yahoo fallback по исходному имени
     data = fetch_yahoo_klines(su, interval)
     if data: return data, "YF"
     return None, None
 
 # ============ DISPLAY (BASE-USDT) ============
 def _to_usdt_display(sym: str) -> str:
-    """
-    Приводит к BASE-USDT для отображения.
-    - Bybit: BTCUSDT → BTC-USDT; US500USDT → US500-USDT; AAPLUSDT → AAPL-USDT
-    - Yahoo crypto: BTC-USD → BTC-USDT
-    - FX без USDT (EURUSD и т.п.) оставляем как есть.
-    """
     s = (sym or "").upper().strip()
-
-    # Bybit: ...USDT без дефиса
     if s.endswith("USDT") and "-" not in s:
-        base = s[:-4]
-        return f"{base}-USDT"
-
-    # Yahoo crypto: ...-USD → ...-USDT
+        return f"{s[:-4]}-USDT"
     if s.endswith("-USD"):
         return s[:-4] + "-USDT"
-
-    # Уже норм
     if s.endswith("-USDT"):
         return s
-
-    # Безопасная попытка для USD-хвоста
     if s.endswith("USD") and "-" not in s and len(s) > 3:
         fx = {"USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD","MXN","CNY","HKD","SGD",
               "SEK","NOK","DKK","ZAR","TRY","PLN","CZK","HUF","ILS","KRW","TWD","THB","INR","BRL","RUB","AED","SAR"}
@@ -313,7 +296,6 @@ def _to_usdt_display(sym: str) -> str:
         if len(letters) == 6 and letters[:3] in fx and letters[3:6] in fx:
             return s  # EURUSD и др. FX оставляем
         return s[:-3] + "-USDT"
-
     return s
 
 def format_signal(symbol: str, sig: str, zone: Optional[str], src: str) -> str:
@@ -324,43 +306,52 @@ def format_signal(symbol: str, sig: str, zone: Optional[str], src: str) -> str:
     return f"{disp} {src_tag} {arrow}{status}".strip()
 
 # ============ SCAN UNIVERSE ============
-# Статические семена для Yahoo (то, чего нет на Bybit, но нужно сканировать)
-STATIC_SEEDS: List[str] = [
-    # RU / индексы / примеры
-    "IMOEX.ME","RTSI.ME",
-    # При желании добавляй сюда любые YF-символы (GAZP.ME, SBER.ME, RF, и т.д.)
-    "RF","AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","BRK-B",
-    # Crypto в YF-стиле (как резерв — если на Bybit нет пары)
-    "BTC-USD","ETH-USD","SOL-USD","XRP-USD","BNB-USD","ADA-USD","DOGE-USD"
+STATIC_YF: List[str] = [
+    # если нужно сканировать то, чего нет на Bybit:
+    "IMOEX.ME","RTSI.ME","RF",
 ]
 
 SCAN_SYMBOLS: List[str] = []
 
+def _is_crypto_major(sym: str) -> bool:
+    """Ровно 15 крипто-пар, всё остальное — не считать криптой для сканера."""
+    return sym in ALLOWED_CRYPTO
+
 def rebuild_scan_universe() -> None:
     """
     Сканируем:
-      - все инструменты Bybit (linear+inverse);
-      - плюс STATIC_SEEDS (YF-символы), без дублей.
+      - 15 крипто-мейджоров с Bybit (если они есть в каталоге);
+      - все НЕ-крипто инструменты Bybit (индексы/металлы/FX/токен-акции);
+      - плюс STATIC_YF как резерв для Yahoo.
     """
     global SCAN_SYMBOLS
     seeds: List[str] = []
 
-    # Все Bybit-символы
-    for bb in sorted(_BB_LINEAR | _BB_INVERSE):
-        seeds.append(bb)
-
-    # Добавить статические YF-семена, которых нет на Bybit
     bb_set = set(_BB_LINEAR | _BB_INVERSE)
-    for y in STATIC_SEEDS:
-        if y.upper() not in bb_set:
+
+    # 1) 15 crypto majors
+    for s in sorted(ALLOWED_CRYPTO):
+        if s in bb_set:
+            seeds.append(s)
+
+    # 2) Все прочие bybit-символы, которые не входят в 15 крипто
+    for s in sorted(bb_set):
+        if s in ALLOWED_CRYPTO:
+            continue
+        seeds.append(s)
+
+    # 3) Добавить статические YF-символы
+    seen = set(seeds)
+    for y in STATIC_YF:
+        if y.upper() not in seen:
             seeds.append(y)
 
     # Уникализация
-    seen=set(); out=[]
+    uniq=set(); out=[]
     for s in seeds:
-        su=s.upper()
-        if su in seen: continue
-        seen.add(su); out.append(s)
+        su = s.upper()
+        if su in uniq: continue
+        uniq.add(su); out.append(s)
     SCAN_SYMBOLS = out
 
 # ============ CORE ============
@@ -384,13 +375,11 @@ def process_symbol(sym: str) -> bool:
         open4 = k4[-2][0]; open1 = k1[-2][0]
         dual_bar_id = max(open4, open1)
 
-        # LIGHT / L+CAN
         if z4 and z1 and z4 == z1:
             sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
             key = f"{sym}|{src}|{sig}|{z4}|{dual_bar_id}"
             return _broadcast_signal(format_signal(sym, sig, z4, src), key)
 
-        # 1TF+CAN
         if z4 and not z1 and candle_pattern(k4):
             key = f"{sym}|{src}|1TF+CAN@4H|{z4}|{open4}"
             return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, src), key)
@@ -405,8 +394,8 @@ def process_symbol(sym: str) -> bool:
 
 def main():
     while True:
-        refresh_bybit_instruments()   # все инструменты Bybit
-        rebuild_scan_universe()       # итоговый список (Bybit + статические YF)
+        refresh_bybit_instruments()
+        rebuild_scan_universe()
 
         for s in SCAN_SYMBOLS:
             process_symbol(s)
