@@ -1,4 +1,4 @@
-# bot.py — DeMarker-28h (BB PERP→BB SPOT→YF SPOT; only 15 crypto; no dupes; USDT display; group-only)
+# bot.py — DeMarker-28h (BB PERP→BB SPOT→YF SPOT; only 15 crypto; stocks+oil+indices; no dupes; group-only)
 
 import os, time, json, requests
 from typing import List, Dict, Optional, Tuple, Set
@@ -136,23 +136,47 @@ BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
 BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT   = 15
 
+# каталоги
 _BB_INFO: Dict[str, Dict[str, Optional[str]]] = {}  # symbol -> {"base":..., "quote":..., "cat":...}
 _BB_LINEAR: Set[str] = set()  # PERP (linear)
 _BB_SPOT:   Set[str] = set()
 
-# 15 популярных крипто-пар (база)
-ALLOWED_CRYPTO: List[str] = [
+# 15 крипто-мейджоров по базе
+ALLOWED_CRYPTO_BASES: List[str] = [
     "BTC","ETH","SOL","BNB","XRP","ADA","DOGE","AVAX","DOT","LINK",
     "LTC","MATIC","TON","TRX","SHIB"
 ]
-ALLOWED_CRYPTO_SET = set(ALLOWED_CRYPTO)
+ALLOWED_CRYPTO_SET = set(ALLOWED_CRYPTO_BASES)
+
+# индексы/металлы/энергия/FX → Bybit символы
+_ALIAS_TO_BB = {
+    # Индексы США
+    "ES":"US500USDT","NQ":"US100USDT","YM":"US30USDT","RTY":"US2000USDT",
+    "^GSPC":"US500USDT","^NDX":"US100USDT","^DJI":"US30USDT","^RUT":"US2000USDT",
+    "VIX":"VIXUSDT","DX":"DXYUSDT",
+    # Глобальные индексы
+    "DE40":"DE40USDT","FR40":"FR40USDT","UK100":"UK100USDT","JP225":"JP225USDT",
+    "HK50":"HK50USDT","CN50":"CN50USDT","AU200":"AU200USDT","ES35":"ES35USDT","IT40":"IT40USDT",
+    # Металлы / Энергия
+    "GC":"XAUUSDT","SI":"XAGUSDT","HG":"XCUUSDT","PL":"XPTUSDT","PA":"XPDUSDT",
+    "CL":"OILUSDT","BZ":"BRENTUSDT","NG":"GASUSDT",
+    # FX (если есть как перпы)
+    "EURUSD":"EURUSD","GBPUSD":"GBPUSD","USDJPY":"USDJPY","AUDUSD":"AUDUSD","NZDUSD":"NZDUSD",
+    "USDCAD":"USDCAD","USDCHF":"USDCHF",
+}
+
+# токен-акции Bybit (пополняй по мере необходимости)
+TOKEN_STOCKS = {
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRKB","AVGO",
+    "JPM","V","MA","UNH","LLY","XOM","KO","PEP","NFLX","AMD"
+}
 
 def refresh_bybit_instruments():
-    """Читаем каталоги: linear (перпы) и spot. Сохраняем base/quote и категорию."""
+    """Читаем каталоги: linear (перпы), spot. Сохраняем base/quote и категорию."""
     global _BB_INFO, _BB_LINEAR, _BB_SPOT
     _BB_INFO = {}; _BB_LINEAR=set(); _BB_SPOT=set()
     try:
-        # linear = перпы USDT
+        # linear = перпы
         r = requests.get(BB_INSTR_EP, params={"category":"linear"}, timeout=BB_TIMEOUT)
         if r.status_code == 200:
             lst = (r.json().get("result") or {}).get("list") or []
@@ -221,27 +245,17 @@ def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional
     except Exception:
         return None
 
-# ============ ALIASES (индексы/металлы/FX → Bybit) ============
-_ALIAS_TO_BB = {
-    # Индексы США
-    "ES":"US500USDT","NQ":"US100USDT","YM":"US30USDT","RTY":"US2000USDT",
-    "^GSPC":"US500USDT","^NDX":"US100USDT","^DJI":"US30USDT","^RUT":"US2000USDT",
-    "VIX":"VIXUSDT","DX":"DXYUSDT",
-    # Глобальные индексы
-    "DE40":"DE40USDT","FR40":"FR40USDT","UK100":"UK100USDT","JP225":"JP225USDT",
-    "HK50":"HK50USDT","CN50":"CN50USDT","AU200":"AU200USDT","ES35":"ES35USDT","IT40":"IT40USDT",
-    # Металлы / Энергия
-    "GC":"XAUUSDT","SI":"XAGUSDT","HG":"XCUUSDT","PL":"XPTUSDT","PA":"XPDUSDT",
-    "CL":"OILUSDT","BZ":"BRENTUSDT","NG":"GASUSDT",
-    # FX (если есть как перпы)
-    "EURUSD":"EURUSD","GBPUSD":"GBPUSD","USDJPY":"USDJPY","AUDUSD":"AUDUSD","NZDUSD":"NZDUSD",
-    "USDCAD":"USDCAD","USDCHF":"USDCHF",
-}
-
+# ============ ALIASES HELPERS ============
 def bb_from_other(sym: str) -> Optional[str]:
+    """Map индексы/металлы/энергия/FX и токен-акции в Bybit-символ."""
     s = (sym or "").upper().strip().replace(" ", "")
     s = s.replace("=F","").replace("=X","").lstrip("^")
-    return _ALIAS_TO_BB.get(s)
+    if s in _ALIAS_TO_BB:
+        return _ALIAS_TO_BB[s]
+    s_norm = s.replace(".", "")  # BRK.B -> BRKB
+    if s_norm in TOKEN_STOCKS:
+        return s_norm + "USDT"
+    return None
 
 # ============ CRYPTO ROUTER (PERP→SPOT→YF) ============
 def _choose_crypto_symbol(base: str) -> Tuple[str, str]:
@@ -250,20 +264,17 @@ def _choose_crypto_symbol(base: str) -> Tuple[str, str]:
       kind ∈ {"BB_LINEAR","BB_SPOT","YF_SPOT"}
       name = символ для запроса свечей
     """
-    # 1) Bybit PERP (linear): BTCUSDT, но иногда Bybit даёт LTCPERP — нормализуем
-    linear = base + "USDT"
-    perp_alt = base + "PERP"
+    linear = base + "USDT"  # обычное имя перпа у Bybit
+    perp_alt = base + "PERP"  # иногда так
     if linear in _BB_LINEAR:
         return "BB_LINEAR", linear
     if perp_alt in _BB_LINEAR:
         return "BB_LINEAR", perp_alt
-
-    # 2) Bybit SPOT
+    # SPOT
     spot = base + "USDT"
     if spot in _BB_SPOT:
         return "BB_SPOT", spot
-
-    # 3) Yahoo spot
+    # Yahoo спот
     return "YF_SPOT", f"{base}-USD"
 
 def fetch_crypto_klines(base: str, interval: str) -> Tuple[Optional[List[List[float]]], Optional[str], Optional[str]]:
@@ -280,7 +291,7 @@ def fetch_crypto_klines(base: str, interval: str) -> Tuple[Optional[List[List[fl
 # ============ DISPLAY (BASE-USDT) ============
 def _to_usdt_display(sym: str) -> str:
     s = (sym or "").upper().strip()
-    if s.endswith("PERP"):  # LTCPERP → LTC-USDT
+    if s.endswith("PERP"):
         return f"{s[:-4]}-USDT"
     if s.endswith("USDT") and "-" not in s:
         return f"{s[:-4]}-USDT"
@@ -300,42 +311,54 @@ def format_signal(symbol: str, sig: str, zone: Optional[str], src: str) -> str:
     return f"{disp} {src_tag} {arrow}{status}".strip()
 
 # ============ SCAN LIST ============
-# Yahoo запас: РФ или иные, которые точно не на Bybit
-STATIC_YF: List[str] = ["IMOEX.ME","RTSI.ME","RF"]
+STATIC_YF: List[str] = [
+    # РФ и акции, если нет на Bybit токена
+    "IMOEX.ME","RTSI.ME","RF",
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK-B","AVGO",
+    "JPM","V","MA","UNH","LLY","XOM","KO","PEP","NFLX","AMD",
+    # резерв крипты только если нет на Bybit вообще
+    # "TON-USD"  # пример, если вдруг нет тикера на Bybit
+]
 
-CRYPTO_BASES = ALLOWED_CRYPTO  # только 15 мейджоров
-OTHER_BYBIT_SYMBOLS: Set[str] = set()  # индексы/металлы/FX (из _ALIAS_TO_BB значений)
+OTHER_BYBIT_SYMBOLS: Set[str] = set()  # индексы/металлы/FX/энергия/токен-акции
 
 def rebuild_scan_universe() -> List[Tuple[str, str]]:
     """
     Возвращает список (kind, name):
       kind ∈ {"CRYPTO","BYBIT_OTHER","YF_ONLY"}
-    CRYPTO — база (BTC/ETH/…): будет PERP→SPOT→YF.
-    BYBIT_OTHER — прямые bybit-символы (индексы/металлы/FX).
-    YF_ONLY — статические YF тикеры.
+    CRYPTO — база (BTC/ETH/…): PERP→SPOT→YF.
+    BYBIT_OTHER — прямые Bybit-символы (US500USDT, XAUUSDT, OILUSDT, EURUSD, AAPLUSDT…).
+    YF_ONLY — чисто YF тикеры.
     """
     global OTHER_BYBIT_SYMBOLS
-    OTHER_BYBIT_SYMBOLS = set(_ALIAS_TO_BB.values())  # US500USDT, XAUUSDT, ...
+    OTHER_BYBIT_SYMBOLS = set(_ALIAS_TO_BB.values())
+    # токен-акции → добавить на Bybit, если есть
+    for t in TOKEN_STOCKS:
+        OTHER_BYBIT_SYMBOLS.add(t + "USDT")
 
     items: List[Tuple[str, str]] = []
+
     # 1) Крипта: 15 баз
-    for b in CRYPTO_BASES:
+    for b in ALLOWED_CRYPTO_BASES:
         items.append(("CRYPTO", b))
-    # 2) Индексы/металлы/FX с Bybit, если реально есть в каталоге
+
+    # 2) Индексы/металлы/энергия/FX/токен-акции — если реально есть в каталоге
     bb_all = set(_BB_LINEAR) | set(_BB_SPOT)
     for sym in sorted(OTHER_BYBIT_SYMBOLS):
         if sym in bb_all:
             items.append(("BYBIT_OTHER", sym))
+
     # 3) YF-only
     for y in STATIC_YF:
         items.append(("YF_ONLY", y))
+
     return items
 
 # ============ CORE ============
 def process_crypto(base: str) -> bool:
     k4, s4, name4 = fetch_crypto_klines(base, KLINE_4H)
     k1, s1, name1 = fetch_crypto_klines(base, KLINE_1D)
-    if not k4 or not k1: 
+    if not k4 or not k1:
         return False
     src = "BB" if (s4=="BB" or s1=="BB") else "YF"
     d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
@@ -359,11 +382,11 @@ def process_crypto(base: str) -> bool:
     return False
 
 def process_bybit_other(sym: str) -> bool:
-    # всегда Bybit linear (если есть), иначе Yahoo по прокси имени
+    # сначала Bybit linear, если нет — попробуем Yahoo по прокси
     k4 = fetch_bybit_klines(sym, KLINE_4H, category="linear") or fetch_yahoo_klines(sym.replace("USDT","-USD"), KLINE_4H)
     k1 = fetch_bybit_klines(sym, KLINE_1D, category="linear") or fetch_yahoo_klines(sym.replace("USDT","-USD"), KLINE_1D)
     if not k4 or not k1: return False
-    src = "BB" if isinstance(k4[0][0], int) and isinstance(k1[0][0], int) and sym in _BB_LINEAR else "YF"
+    src = "BB" if sym in _BB_LINEAR else "YF"
     d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
     if not d4 or not d1: return False
     v4 = last_closed(d4); v1 = last_closed(d1)
@@ -415,9 +438,9 @@ def main():
             if kind == "CRYPTO":
                 process_crypto(name)        # name = base (BTC/ETH/…)
             elif kind == "BYBIT_OTHER":
-                process_bybit_other(name)   # name = bybit symbol (US500USDT, XAUUSDT, …)
+                process_bybit_other(name)   # name = Bybit symbol (US500USDT, XAUUSDT, OILUSDT, AAPLUSDT…)
             else:
-                process_yf_only(name)       # name = YF symbol (IMOEX.ME, RF, …)
+                process_yf_only(name)       # name = YF symbol (IMOEX.ME, RF, AAPL …)
             time.sleep(1)
 
         gc_state(STATE, 21)
