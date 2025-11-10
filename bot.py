@@ -1,4 +1,4 @@
-# bot.py — Bybit primary → Yahoo fallback; 15 crypto majors; commodities/indices/FX/xStocks; no Russell; group-only
+# bot.py — Bybit primary → Yahoo fallback; 15 crypto majors; commodities/indices/FX/xStocks; source tags; no Russell
 
 import os, time, json, requests
 from typing import List, Dict, Optional, Tuple, Set
@@ -80,7 +80,7 @@ def _broadcast_signal(text: str, signal_key: str) -> bool:
             sent_any = True
     return sent_any
 
-# ===== INDICATORS (без упоминаний в сообщениях) =====
+# ===== INDICATORS =====
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
     if not ohlc or len(ohlc) < length + 2:
         return None
@@ -135,7 +135,7 @@ BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
 BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT   = 15
 
-_BB_LINEAR: Set[str] = set()  # PERP
+_BB_LINEAR: Set[str] = set()  # PERP (linear)
 _BB_SPOT:   Set[str] = set()
 
 def refresh_bybit_instruments():
@@ -239,6 +239,40 @@ YF_ONLY_DEFAULT = [
     "MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME","PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
 ]
 
+# ===== FX DETECTION =====
+FX_ISO = {"USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD","MXN","CNY","HKD","SGD",
+          "SEK","NOK","DKK","ZAR","TRY","PLN","CZK","HUF","ILS","KRW","TWD","THB",
+          "INR","BRL","RUB","AED","SAR"}
+
+def is_fx_pair(sym: str) -> bool:
+    s = "".join(ch for ch in (sym or "").upper() if ch.isalpha())
+    return len(s) >= 6 and s[:3] in FX_ISO and s[3:6] in FX_ISO
+
+# ===== DISPLAY (с источником) =====
+def to_usdt_display(sym: str) -> str:
+    s = (sym or "").upper().strip()
+    # FX → PAIR-USD
+    if is_fx_pair(s) or s.endswith("=X"):
+        letters = "".join(ch for ch in s if ch.isalpha())
+        pair6 = letters[:6] if len(letters)>=6 else letters
+        return f"{pair6}-USD"
+    # РФ тикеры .ME — оставляем как есть
+    if s.endswith(".ME"):
+        return s
+    # прочее в USDT
+    if s.endswith("PERP"): return f"{s[:-4]}-USDT"
+    if s.endswith("USDT") and "-" not in s: return f"{s[:-4]}-USDT"
+    if s.endswith("-USD"): return s  # уже нормализован индексы через -USD (редко)
+    if s.endswith("-USDT"): return s
+    if s.endswith("USD") and "-" not in s and len(s)>3: return s[:-3] + "-USDT"
+    return s
+
+def format_signal(symbol: str, sig: str, zone: Optional[str], src_tag: str) -> str:
+    arrow  = "🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
+    status = "⚡" if sig=="LIGHT" else ("⚡🕯️" if sig=="L+CAN" else "🕯️")
+    return f"{to_usdt_display(symbol)} [{src_tag}] {arrow}{status}".strip()
+
+# ===== HELPERS =====
 def bybit_symbol_for_alias(sym: str) -> Optional[str]:
     s = (sym or "").upper().strip().replace(" ", "")
     s = s.replace("=F","").replace("=X","").lstrip("^")
@@ -249,69 +283,54 @@ def bybit_symbol_for_alias(sym: str) -> Optional[str]:
         return s_norm + "USDT"
     return None
 
-# ===== DISPLAY (без источников) =====
-def to_usdt_display(sym: str) -> str:
-    s = (sym or "").upper().strip()
-    if s.endswith("PERP"):
-        return f"{s[:-4]}-USDT"
-    if s.endswith("USDT") and "-" not in s:
-        return f"{s[:-4]}-USDT"
-    if s.endswith("-USD"):
-        return s[:-4] + "-USDT"
-    if s.endswith("-USDT"):
-        return s
-    if s.endswith("USD") and "-" not in s and len(s)>3:
-        return s[:-3] + "-USDT"
-    return s
-
-def format_signal(symbol: str, sig: str, zone: Optional[str]) -> str:
-    arrow  = "🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
-    status = "⚡" if sig=="LIGHT" else ("⚡🕯️" if sig=="L+CAN" else "🕯️")
-    return f"{to_usdt_display(symbol)} {arrow}{status}".strip()
+def _choose_src_tag(src4: str, src1: str) -> str:
+    return "BB" if ("BB" in (src4, src1)) else "YF"
 
 # ===== FETCH ROUTERS =====
-def fetch_crypto(base: str, interval: str) -> Tuple[Optional[List[List[float]]], str]:
+def fetch_crypto(base: str, interval: str) -> Tuple[Optional[List[List[float]]], str, str]:
     # 1) Bybit PERP
     bb_linear = base + "USDT"
-    bb_perp_alt = base + "PERP"
+    bb_perp   = base + "PERP"
     if bb_linear in _BB_LINEAR:
         d = fetch_bybit_klines(bb_linear, interval, "linear")
-        if d: return d, bb_linear
-    if bb_perp_alt in _BB_LINEAR:
-        d = fetch_bybit_klines(bb_perp_alt, interval, "linear")
-        if d: return d, bb_perp_alt
+        if d: return d, bb_linear, "BB"
+    if bb_perp in _BB_LINEAR:
+        d = fetch_bybit_klines(bb_perp, interval, "linear")
+        if d: return d, bb_perp, "BB"
     # 2) Bybit SPOT
     bb_spot = base + "USDT"
     if bb_spot in _BB_SPOT:
         d = fetch_bybit_klines(bb_spot, interval, "spot")
-        if d: return d, bb_spot
+        if d: return d, bb_spot, "BB"
     # 3) Yahoo SPOT
-    return fetch_yahoo_klines(f"{base}-USD", interval), f"{base}-USD"
+    return fetch_yahoo_klines(f"{base}-USD", interval), f"{base}-USD", "YF"
 
-def fetch_other(symbol_hint: str, interval: str) -> Tuple[Optional[List[List[float]]], str]:
-    """
-    commodities/indices/FX/xStocks:
-    сначала Bybit (linear), иначе Yahoo (-USD или *.ME)
-    """
-    bb = bybit_symbol_for_alias(symbol_hint) or symbol_hint
-    bb = bb.upper()
+def fetch_other(symbol_hint: str, interval: str) -> Tuple[Optional[List[List[float]]], str, str]:
+    bb = (bybit_symbol_for_alias(symbol_hint) or symbol_hint).upper()
 
-    # Bybit linear
+    # Bybit linear сначала
     if bb in _BB_LINEAR:
         d = fetch_bybit_klines(bb, interval, "linear")
-        if d: return d, bb
+        if d: return d, bb, "BB"
 
-    # Yahoo proxy
-    yf = bb
-    if yf.endswith(".ME"):
-        # РФ тикеры уже корректные для Yahoo
-        pass
-    elif "USDT" in yf and "-" not in yf:
-        yf = yf.replace("USDT", "-USD")
-    elif "-" not in yf:
-        yf = yf + "-USD"
+    # Резерв Yahoo
+    # РФ тикеры уже *.ME
+    if bb.endswith(".ME"):
+        return fetch_yahoo_klines(bb, interval), bb, "YF"
 
-    return fetch_yahoo_klines(yf, interval), yf
+    # FX → EURUSD=X и т.п.
+    if is_fx_pair(bb):
+        yf = "".join(ch for ch in bb if ch.isalpha())[:6] + "=X"
+        return fetch_yahoo_klines(yf, interval), yf, "YF"
+
+    # Прочее → -USD
+    if "USDT" in bb and "-" not in bb:
+        yf = bb.replace("USDT", "-USD")
+    elif "-" not in bb:
+        yf = bb + "-USD"
+    else:
+        yf = bb
+    return fetch_yahoo_klines(yf, interval), yf, "YF"
 
 # ===== PLAN =====
 def build_plan() -> List[Tuple[str, str]]:
@@ -330,8 +349,8 @@ def build_plan() -> List[Tuple[str, str]]:
 
 # ===== CORE =====
 def process_crypto(base: str) -> bool:
-    k4, name4 = fetch_crypto(base, KLINE_4H)
-    k1, name1 = fetch_crypto(base, KLINE_1D)
+    k4, name4, s4 = fetch_crypto(base, KLINE_4H)
+    k1, name1, s1 = fetch_crypto(base, KLINE_1D)
     if not k4 or not k1:
         return False
     d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
@@ -342,21 +361,22 @@ def process_crypto(base: str) -> bool:
     open4 = k4[-2][0]; open1 = k1[-2][0]
     dual_bar_id = max(open4, open1)
     sym = name4 or name1 or base
+    tag = _choose_src_tag(s4, s1)
     if z4 and z1 and z4==z1:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
-        return _broadcast_signal(format_signal(sym, sig, z4), key)
+        return _broadcast_signal(format_signal(sym, sig, z4, tag), key)
     if z4 and not z1 and candle_pattern(k4):
         key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, tag), key)
     if z1 and not z4 and candle_pattern(k1):
         key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, tag), key)
     return False
 
 def process_other(hint: str) -> bool:
-    k4, name4 = fetch_other(hint, KLINE_4H)
-    k1, name1 = fetch_other(hint, KLINE_1D)
+    k4, name4, s4 = fetch_other(hint, KLINE_4H)
+    k1, name1, s1 = fetch_other(hint, KLINE_1D)
     if not k4 or not k1:
         return False
     d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
@@ -367,16 +387,17 @@ def process_other(hint: str) -> bool:
     open4 = k4[-2][0]; open1 = k1[-2][0]
     dual_bar_id = max(open4, open1)
     sym = name4 or name1 or hint
+    tag = _choose_src_tag(s4, s1)
     if z4 and z1 and z4==z1:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
-        return _broadcast_signal(format_signal(sym, sig, z4), key)
+        return _broadcast_signal(format_signal(sym, sig, z4, tag), key)
     if z4 and not z1 and candle_pattern(k4):
         key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, tag), key)
     if z1 and not z4 and candle_pattern(k1):
         key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, tag), key)
     return False
 
 def process_yf_only(sym: str) -> bool:
@@ -391,16 +412,17 @@ def process_yf_only(sym: str) -> bool:
     z4 = zone_of(v4); z1 = zone_of(v1)
     open4 = k4[-2][0]; open1 = k1[-2][0]
     dual_bar_id = max(open4, open1)
+    tag = "YF"
     if z4 and z1 and z4==z1:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
-        return _broadcast_signal(format_signal(sym, sig, z4), key)
+        return _broadcast_signal(format_signal(sym, sig, z4, tag), key)
     if z4 and not z1 and candle_pattern(k4):
         key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, tag), key)
     if z1 and not z4 and candle_pattern(k1):
         key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, tag), key)
     return False
 
 def main():
