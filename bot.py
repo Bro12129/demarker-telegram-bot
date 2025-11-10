@@ -138,10 +138,47 @@ def candle_pattern(ohlc):
     if not ohlc or len(ohlc)<4: return False
     return wick_ge_body_pct(ohlc,-2,0.25) or engulfing_with_prior(ohlc,-2)
 
+# === NORMALIZE FOR NOTIFICATION (display only) ===
+def normalize_symbol(raw: str) -> str:
+    """
+    Отображение:
+      - FX пары -> <PAIR>-USD  (EURUSD-USD, USDJPY-USD)
+      - Остальное -> <TICKER>-USDT  (BTC-USDT, ES-USDT, AAPL-USDT, XAU-USDT, US500-USDT)
+    Ключи дедупликации НЕ меняются.
+    """
+    s = (raw or "").upper().strip()
+    # убрать спец-окончания Yahoo
+    s = s.replace("=F", "").replace("=X", "")
+    # унифицировать разделители
+    s = s.replace("/", "-")
+    # убрать лидирующий '^' у индексов
+    if s.startswith("^"):
+        s = s[1:]
+    # убрать пробелы
+    s = s.replace(" ", "")
+
+    # детекция FX: первые 6 букв = 2 ISO-кода по 3 буквы
+    FX = {
+        "USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD","MXN","CNY","HKD","SGD",
+        "SEK","NOK","DKK","ZAR","TRY","PLN","CZK","HUF","ILS","KRW","TWD","THB",
+        "INR","BRL","RUB","AED","SAR"
+    }
+    letters = "".join(ch for ch in s if ch.isalpha())
+    is_fx = len(letters) >= 6 and letters[:3] in FX and letters[3:6] in FX
+
+    if is_fx:
+        pair6 = letters[:6]  # EURUSD, USDJPY, ...
+        return pair6 + "-USD"
+
+    # всё остальное — к USDT
+    core = s.split("-")[0]  # берём до первого дефиса, если был
+    return core + "-USDT"
+
 def format_signal(symbol: str, sig: str, zone: Optional[str]) -> str:
     arrow="🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
     status="⚡" if sig=="LIGHT" else ("⚡🕯️" if sig=="L+CAN" else "🕯️")
-    return f"{symbol} {arrow}{status}"
+    # ВЫВОДИМ нормализованный символ ТОЛЬКО в тексте уведомления
+    return f"{normalize_symbol(symbol)} {arrow}{status}"
 
 # ============ SYMBOL UNIVERSE ============
 YF_SYMBOLS = [
