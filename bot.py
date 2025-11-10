@@ -1,4 +1,4 @@
-# bot.py — Bybit primary → Yahoo fallback; 15 crypto majors; commodities/indices/FX/xStocks; source tags; no Russell
+# bot.py — Bybit primary → Yahoo fallback; 15 crypto majors; commodities/indices/FX/xStocks; source tags; 4-свечное поглощение; no Russell
 
 import os, time, json, requests
 from typing import List, Dict, Optional, Tuple, Set
@@ -115,19 +115,37 @@ def wick_ge_body_pct(ohlc, idx, pct=0.25):
     upper=h-max(o,c); lower=min(o,c)-l
     return (upper>=pct*body) or (lower>=pct*body)
 
-def engulfing_with_prior(ohlc, idx):
-    if len(ohlc)<4: return False
-    o0,h0,l0,c0=ohlc[idx][1:5]; o1,h1,l1,c1=ohlc[idx-1][1:5]
-    o2,c2=ohlc[idx-2][1],ohlc[idx-2][4]; o3,c3=ohlc[idx-3][1],ohlc[idx-3][4]
-    bull0=c0>=o0; bull2=c2>=o2; bull3=c3>=o3
-    if bull0:
-        return (not bull2 and not bull3) and (min(o0,c0)<=min(o1,c1)) and (max(o0,c0)>=max(o1,c1))
-    else:
-        return (bull2 and bull3) and (min(o0,c0)<=min(o1,c1)) and (max(o0,c0)>=max(o1,c1))
+# --- Новая реализация поглощения по 4 свечам ---
+def engulfing_with_prior4(ohlc) -> bool:
+    """
+    -1 : текущая (не закрыта), не используется
+    -2 : поглощающая (закрыта)
+    -3 : поглощённая, противоположного цвета -2
+    -4 : того же цвета, что -3 (микро-тренд)
+    Поглощение проверяем по ТЕЛАМ (fitili не учитываем).
+    """
+    if not ohlc or len(ohlc) < 4:
+        return False
+    try:
+        o2,h2,l2,c2 = ohlc[-2][1:5]  # поглощающая
+        o3,h3,l3,c3 = ohlc[-3][1:5]  # поглощённая
+        o4,h4,l4,c4 = ohlc[-4][1:5]  # фон того же цвета, что -3
+    except Exception:
+        return False
+
+    bull2 = c2 >= o2
+    bull3 = c3 >= o3
+    bull4 = c4 >= o4
+
+    cover_body = (min(o2,c2) <= min(o3,c3)) and (max(o2,c2) >= max(o3,c3))
+
+    bull_engulf = bull2 and (not bull3) and (not bull4) and cover_body
+    bear_engulf = (not bull2) and bull3 and bull4 and cover_body
+    return bull_engulf or bear_engulf
 
 def candle_pattern(ohlc):
     if not ohlc or len(ohlc)<4: return False
-    return wick_ge_body_pct(ohlc,-2,0.25) or engulfing_with_prior(ohlc,-2)
+    return wick_ge_body_pct(ohlc,-2,0.25) or engulfing_with_prior4(ohlc)
 
 # ===== BYBIT API =====
 BYBIT_BASE   = os.getenv("BYBIT_BASE", "https://api.bybit.com")
@@ -205,12 +223,10 @@ def fetch_yahoo_klines(symbol: str, interval: str) -> Optional[List[List[float]]
         return None
 
 # ===== UNIVERSE / ALIASES =====
-# 15 крипто-мажоров (база)
 CRYPTO_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX","DOT","LINK","LTC","MATIC","TON","ATOM","NEAR"]
 
-# индексы/металлы/энергия/FX → Bybit символы (без Russell)
 ALIAS_TO_BB = {
-    # US indices
+    # US indices (no Russell)
     "ES":"US500USDT","^GSPC":"US500USDT",
     "NQ":"US100USDT","^NDX":"US100USDT",
     "YM":"US30USDT","^DJI":"US30USDT",
@@ -221,18 +237,16 @@ ALIAS_TO_BB = {
     # Metals / Energy
     "GC":"XAUUSDT","SI":"XAGUSDT","HG":"XCUUSDT","PL":"XPTUSDT","PA":"XPDUSDT",
     "CL":"OILUSDT","BZ":"BRENTUSDT","NG":"GASUSDT",
-    # FX (если есть у Bybit)
+    # FX (if present on Bybit)
     "EURUSD":"EURUSD","GBPUSD":"GBPUSD","USDJPY":"USDJPY","AUDUSD":"AUDUSD","NZDUSD":"NZDUSD",
     "USDCAD":"USDCAD","USDCHF":"USDCHF",
 }
 
-# токен-акции Bybit (дополни при необходимости)
 TOKEN_STOCKS = {
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRKB","AVGO","NFLX","AMD",
     "JPM","V","MA","UNH","LLY","XOM","KO","PEP"
 }
 
-# РФ индексы/акции — Yahoo (если нет на Bybit)
 YF_ONLY_DEFAULT = [
     "IMOEX.ME","RTSI.ME",
     "GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME","ALRS.ME","GMKN.ME","YNDX.ME",
@@ -248,7 +262,7 @@ def is_fx_pair(sym: str) -> bool:
     s = "".join(ch for ch in (sym or "").upper() if ch.isalpha())
     return len(s) >= 6 and s[:3] in FX_ISO and s[3:6] in FX_ISO
 
-# ===== DISPLAY (с источником) =====
+# ===== DISPLAY =====
 def to_usdt_display(sym: str) -> str:
     s = (sym or "").upper().strip()
     # FX → PAIR-USD
@@ -256,13 +270,13 @@ def to_usdt_display(sym: str) -> str:
         letters = "".join(ch for ch in s if ch.isalpha())
         pair6 = letters[:6] if len(letters)>=6 else letters
         return f"{pair6}-USD"
-    # РФ тикеры .ME — оставляем как есть
+    # РФ тикеры .ME — как есть
     if s.endswith(".ME"):
         return s
-    # прочее в USDT
+    # прочее → -USDT
     if s.endswith("PERP"): return f"{s[:-4]}-USDT"
     if s.endswith("USDT") and "-" not in s: return f"{s[:-4]}-USDT"
-    if s.endswith("-USD"): return s  # уже нормализован индексы через -USD (редко)
+    if s.endswith("-USD"): return s
     if s.endswith("-USDT"): return s
     if s.endswith("USD") and "-" not in s and len(s)>3: return s[:-3] + "-USDT"
     return s
@@ -314,16 +328,13 @@ def fetch_other(symbol_hint: str, interval: str) -> Tuple[Optional[List[List[flo
         if d: return d, bb, "BB"
 
     # Резерв Yahoo
-    # РФ тикеры уже *.ME
     if bb.endswith(".ME"):
         return fetch_yahoo_klines(bb, interval), bb, "YF"
 
-    # FX → EURUSD=X и т.п.
     if is_fx_pair(bb):
         yf = "".join(ch for ch in bb if ch.isalpha())[:6] + "=X"
         return fetch_yahoo_klines(yf, interval), yf, "YF"
 
-    # Прочее → -USD
     if "USDT" in bb and "-" not in bb:
         yf = bb.replace("USDT", "-USD")
     elif "-" not in bb:
@@ -335,14 +346,11 @@ def fetch_other(symbol_hint: str, interval: str) -> Tuple[Optional[List[List[flo
 # ===== PLAN =====
 def build_plan() -> List[Tuple[str, str]]:
     plan: List[Tuple[str,str]] = []
-    # 1) Крипта 15 мажоров
     for b in CRYPTO_BASES:
         plan.append(("CRYPTO", b))
-    # 2) Индексы/металлы/энергия/FX/токен-акции
     keys = sorted(set(list(ALIAS_TO_BB.keys()) + list(TOKEN_STOCKS)))
     for k in keys:
         plan.append(("OTHER", k))
-    # 3) РФ блок (Yahoo)
     for y in YF_ONLY_DEFAULT:
         plan.append(("YF_ONLY", y))
     return plan
@@ -418,10 +426,10 @@ def process_yf_only(sym: str) -> bool:
         key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
         return _broadcast_signal(format_signal(sym, sig, z4, tag), key)
     if z4 and not z1 and candle_pattern(k4):
-        key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
+        key = f"{sym}|1TF+CAN@4H|{з4}|{open4}"
         return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, tag), key)
     if z1 and not z4 and candle_pattern(k1):
-        key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
+        key = f"{sym}|1TF+CAN@1D|{з1}|{open1}"
         return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, tag), key)
     return False
 
