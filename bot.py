@@ -1,4 +1,4 @@
-# bot.py — DeMarker-28h (Bybit→Yahoo, 15 crypto majors, USDT display, group-only)
+# bot.py — DeMarker-28h (Bybit→Yahoo, ONLY 15 crypto majors, USDT display, group-only)
 
 import os, time, json, requests
 from typing import List, Dict, Optional, Tuple, Set
@@ -138,6 +138,7 @@ BB_TIMEOUT   = 15
 
 _BB_LINEAR: Set[str] = set()
 _BB_INVERSE: Set[str] = set()
+_BB_INFO: Dict[str, Dict[str, Optional[str]]] = {}  # symbol -> {"base":..., "quote":...}
 
 # 15 популярных крипто-пар (Bybit symbols)
 ALLOWED_CRYPTO: Set[str] = {
@@ -145,10 +146,12 @@ ALLOWED_CRYPTO: Set[str] = {
     "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT",
     "LTCUSDT","MATICUSDT","TONUSDT","TRXUSDT","SHIBUSDT"
 }
+ALLOWED_BASES: Set[str] = {s[:-4] for s in ALLOWED_CRYPTO}  # BTC, ETH, …
 
 def refresh_bybit_instruments():
-    global _BB_LINEAR, _BB_INVERSE
-    _BB_LINEAR=set(); _BB_INVERSE=set()
+    """Сохраняем полный список и базу/квоту, чтобы отличать крипту от не-крипты."""
+    global _BB_LINEAR, _BB_INVERSE, _BB_INFO
+    _BB_LINEAR=set(); _BB_INVERSE=set(); _BB_INFO={}
     try:
         for cat in ("linear","inverse"):
             r = requests.get(BB_INSTR_EP, params={"category":cat}, timeout=BB_TIMEOUT)
@@ -158,7 +161,11 @@ def refresh_bybit_instruments():
             lst = (j.get("result") or {}).get("list") or []
             for it in lst:
                 sym = str(it.get("symbol","")).upper().strip()
-                if not sym: continue
+                if not sym:
+                    continue
+                base = (it.get("baseCoin") or it.get("base")).upper() if it.get("baseCoin") or it.get("base") else None
+                quote= (it.get("quoteCoin") or it.get("quote")).upper() if it.get("quoteCoin") or it.get("quote") else None
+                _BB_INFO[sym] = {"base": base, "quote": quote}
                 if cat=="linear": _BB_LINEAR.add(sym)
                 else: _BB_INVERSE.add(sym)
     except Exception:
@@ -243,9 +250,8 @@ def bb_from_other(sym: str) -> Optional[str]:
                "GSPC":"US500USDT","NDX":"US100USDT","DJI":"US30USDT","RUT":"US2000USDT"}
     if s in idx_map:
         return idx_map[s]
-    # акции: AAPL → AAPLUSDT (если есть токен на Bybit)
     if s.isalpha() and 1 < len(s) <= 6:
-        return s + "USDT"
+        return s + "USDT"  # токен-акции
     return None
 
 # ============ ROUTER ============
@@ -259,23 +265,19 @@ def fetch_klines(sym: str, interval: str) -> Tuple[Optional[List[List[float]]], 
     """
     su = (sym or "").upper().strip()
 
-    # Уже Bybit-символ
     if _is_bybit_symbol(su):
         data = fetch_bybit_klines(su, interval)
         if data: return data, "BB"
-        # последний шанс — прокси имя в Yahoo (AAPLUSDT→AAPL-USD, US500USDT→US500-USD)
         yproxy = su.replace("USDT","-USD")
         data = fetch_yahoo_klines(yproxy, interval)
         if data: return data, "YF"
         return None, None
 
-    # Пробуем замапить в Bybit через алиас
     bb = bb_from_other(su)
     if bb and _is_bybit_symbol(bb):
         data = fetch_bybit_klines(bb, interval)
         if data: return data, "BB"
 
-    # Yahoo fallback по исходному имени
     data = fetch_yahoo_klines(su, interval)
     if data: return data, "YF"
     return None, None
@@ -294,7 +296,7 @@ def _to_usdt_display(sym: str) -> str:
               "SEK","NOK","DKK","ZAR","TRY","PLN","CZK","HUF","ILS","KRW","TWD","THB","INR","BRL","RUB","AED","SAR"}
         letters = "".join(ch for ch in s if ch.isalpha())
         if len(letters) == 6 and letters[:3] in fx and letters[3:6] in fx:
-            return s  # EURUSD и др. FX оставляем
+            return s
         return s[:-3] + "-USDT"
     return s
 
@@ -307,38 +309,48 @@ def format_signal(symbol: str, sig: str, zone: Optional[str], src: str) -> str:
 
 # ============ SCAN UNIVERSE ============
 STATIC_YF: List[str] = [
-    # если нужно сканировать то, чего нет на Bybit:
-    "IMOEX.ME","RTSI.ME","RF",
+    "IMOEX.ME","RTSI.ME","RF"
 ]
 
 SCAN_SYMBOLS: List[str] = []
 
-def _is_crypto_major(sym: str) -> bool:
-    """Ровно 15 крипто-пар, всё остальное — не считать криптой для сканера."""
-    return sym in ALLOWED_CRYPTO
+def _is_crypto_symbol(sym: str) -> bool:
+    """Определяем крипто-перп по каталогу Bybit: quote=USDT и base ∈ ALLOWED_BASES или вообще крипта."""
+    info = _BB_INFO.get(sym)
+    if not info: 
+        return False
+    return (info.get("quote") == "USDT") and bool(info.get("base"))
+
+def _is_allowed_crypto(sym: str) -> bool:
+    info = _BB_INFO.get(sym) or {}
+    base = (info.get("base") or "")
+    return (sym in ALLOWED_CRYPTO) or (base in ALLOWED_BASES and info.get("quote") == "USDT")
 
 def rebuild_scan_universe() -> None:
     """
     Сканируем:
-      - 15 крипто-мейджоров с Bybit (если они есть в каталоге);
-      - все НЕ-крипто инструменты Bybit (индексы/металлы/FX/токен-акции);
-      - плюс STATIC_YF как резерв для Yahoo.
+      - ТОЛЬКО 15 crypto majors (по baseCoin/quoteCoin);
+      - Все НЕ-крипто инструменты Bybit (индексы/металлы/FX/токен-акции);
+      - Плюс STATIC_YF.
     """
     global SCAN_SYMBOLS
     seeds: List[str] = []
 
-    bb_set = set(_BB_LINEAR | _BB_INVERSE)
+    bb_all = sorted(_BB_LINEAR | _BB_INVERSE)
 
-    # 1) 15 crypto majors
-    for s in sorted(ALLOWED_CRYPTO):
-        if s in bb_set:
+    # 1) 15 crypto majors только
+    for s in bb_all:
+        if _is_allowed_crypto(s):
             seeds.append(s)
 
-    # 2) Все прочие bybit-символы, которые не входят в 15 крипто
-    for s in sorted(bb_set):
-        if s in ALLOWED_CRYPTO:
-            continue
-        seeds.append(s)
+    # 2) Не-крипта: включаем всё остальное, что не крипта
+    for s in bb_all:
+        if _is_crypto_symbol(s):
+            # крипта, но не в разрешённых — пропускаем
+            if not _is_allowed_crypto(s):
+                continue
+        else:
+            seeds.append(s)
 
     # 3) Добавить статические YF-символы
     seen = set(seeds)
