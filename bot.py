@@ -1,4 +1,4 @@
-# bot.py — DeMarker-28h (Bybit→Yahoo, ONLY 15 crypto majors, USDT display, group-only)
+# bot.py — DeMarker-28h (BB PERP→BB SPOT→YF SPOT; only 15 crypto; no dupes; USDT display; group-only)
 
 import os, time, json, requests
 from typing import List, Dict, Optional, Tuple, Set
@@ -9,9 +9,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-DEM_LEN  = 28
-DEM_OB   = 0.70
-DEM_OS   = 0.30
+DEM_LEN  = int(os.getenv("DEM_LEN", "28"))
+DEM_OB   = float(os.getenv("DEM_OB", "0.70"))
+DEM_OS   = float(os.getenv("DEM_OS", "0.30"))
 
 KLINE_4H   = os.getenv("KLINE_4H", "4h")
 KLINE_1D   = os.getenv("KLINE_1D", "1d")
@@ -136,82 +136,79 @@ BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
 BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT   = 15
 
-_BB_LINEAR: Set[str] = set()
-_BB_INVERSE: Set[str] = set()
-_BB_INFO: Dict[str, Dict[str, Optional[str]]] = {}  # symbol -> {"base":..., "quote":...}
+_BB_INFO: Dict[str, Dict[str, Optional[str]]] = {}  # symbol -> {"base":..., "quote":..., "cat":...}
+_BB_LINEAR: Set[str] = set()  # PERP (linear)
+_BB_SPOT:   Set[str] = set()
 
-# 15 популярных крипто-пар (Bybit symbols)
-ALLOWED_CRYPTO: Set[str] = {
-    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
-    "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT",
-    "LTCUSDT","MATICUSDT","TONUSDT","TRXUSDT","SHIBUSDT"
-}
-ALLOWED_BASES: Set[str] = {s[:-4] for s in ALLOWED_CRYPTO}  # BTC, ETH, …
+# 15 популярных крипто-пар (база)
+ALLOWED_CRYPTO: List[str] = [
+    "BTC","ETH","SOL","BNB","XRP","ADA","DOGE","AVAX","DOT","LINK",
+    "LTC","MATIC","TON","TRX","SHIB"
+]
+ALLOWED_CRYPTO_SET = set(ALLOWED_CRYPTO)
 
 def refresh_bybit_instruments():
-    """Сохраняем полный список и базу/квоту, чтобы отличать крипту от не-крипты."""
-    global _BB_LINEAR, _BB_INVERSE, _BB_INFO
-    _BB_LINEAR=set(); _BB_INVERSE=set(); _BB_INFO={}
+    """Читаем каталоги: linear (перпы) и spot. Сохраняем base/quote и категорию."""
+    global _BB_INFO, _BB_LINEAR, _BB_SPOT
+    _BB_INFO = {}; _BB_LINEAR=set(); _BB_SPOT=set()
     try:
-        for cat in ("linear","inverse"):
-            r = requests.get(BB_INSTR_EP, params={"category":cat}, timeout=BB_TIMEOUT)
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            lst = (j.get("result") or {}).get("list") or []
+        # linear = перпы USDT
+        r = requests.get(BB_INSTR_EP, params={"category":"linear"}, timeout=BB_TIMEOUT)
+        if r.status_code == 200:
+            lst = (r.json().get("result") or {}).get("list") or []
             for it in lst:
                 sym = str(it.get("symbol","")).upper().strip()
-                if not sym:
-                    continue
-                base = (it.get("baseCoin") or it.get("base")).upper() if it.get("baseCoin") or it.get("base") else None
-                quote= (it.get("quoteCoin") or it.get("quote")).upper() if it.get("quoteCoin") or it.get("quote") else None
-                _BB_INFO[sym] = {"base": base, "quote": quote}
-                if cat=="linear": _BB_LINEAR.add(sym)
-                else: _BB_INVERSE.add(sym)
+                base = (it.get("baseCoin") or it.get("base") or "").upper()
+                quote= (it.get("quoteCoin") or it.get("quote") or "").upper()
+                _BB_INFO[sym] = {"base": base, "quote": quote, "cat":"linear"}
+                _BB_LINEAR.add(sym)
+        # spot
+        r = requests.get(BB_INSTR_EP, params={"category":"spot"}, timeout=BB_TIMEOUT)
+        if r.status_code == 200:
+            lst = (r.json().get("result") or {}).get("list") or []
+            for it in lst:
+                sym = str(it.get("symbol","")).upper().strip()   # BTCUSDT и т.п.
+                base = (it.get("baseCoin") or it.get("base") or "").upper()
+                quote= (it.get("quoteCoin") or it.get("quote") or "").upper()
+                _BB_INFO[sym] = {"base": base, "quote": quote, "cat":"spot"}
+                _BB_SPOT.add(sym)
     except Exception:
         return
 
-def fetch_bybit_klines(symbol_bb: str, interval: str, category_hint: Optional[str]=None, limit: int = 600) -> Optional[List[List[float]]]:
-    iv = "240" if interval == "4h" else ("D" if interval.lower() == "1d" else interval)
-    cats = [category_hint] if category_hint in ("linear","inverse") else ["linear","inverse"]
+def fetch_bybit_klines(symbol: str, interval: str, category: str, limit: int = 600) -> Optional[List[List[float]]]:
+    iv = "240" if interval == "4h" else ("D" if interval.lower()=="1d" else interval)
     try:
-        for cat in cats:
-            r = requests.get(BB_KLINES_EP, params={"category":cat, "symbol":symbol_bb, "interval":iv, "limit":str(limit)}, timeout=BB_TIMEOUT)
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            lst = (j.get("result") or {}).get("list") or []
-            if not lst:
-                continue
-            out=[]
-            for k in lst:
-                ts = int(k[0])
-                if ts > 10**12: ts //= 1000
-                o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4])
-                if h<=0 or l<=0: continue
-                out.append([ts,o,h,l,c])
-            out.sort(key=lambda x:x[0])
-            return out if out else None
-        return None
+        r = requests.get(BB_KLINES_EP, params={"category":category, "symbol":symbol, "interval":iv, "limit":str(limit)}, timeout=BB_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        lst = (r.json().get("result") or {}).get("list") or []
+        if not lst: return None
+        out=[]
+        for k in lst:
+            ts = int(k[0]); 
+            if ts > 10**12: ts //= 1000
+            o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4])
+            if h<=0 or l<=0: continue
+            out.append([ts,o,h,l,c])
+        out.sort(key=lambda x:x[0])
+        return out if out else None
     except Exception:
         return None
 
+# --- Yahoo (SPOT fallback) ---
 def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": interval, "range": "180d"}
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=15)
         if r.status_code != 200: return None
-        chart = r.json().get("chart", {})
-        results = chart.get("result", [])
-        if not results: return None
-        j = results[0]
+        j = (r.json().get("chart") or {}).get("result") or []
+        if not j: return None
+        j = j[0]
         ts = j.get("timestamp") or []
-        ind = j.get("indicators", {}).get("quote", [])
-        if not ts or not ind: return None
-        q = ind[0]
+        q = ((j.get("indicators") or {}).get("quote") or [{}])[0]
         opens, highs, lows, closes = q.get("open"), q.get("high"), q.get("low"), q.get("close")
-        if not (opens and highs and lows and closes): return None
+        if not (ts and opens and highs and lows and closes): return None
         out=[]
         for i in range(min(len(ts), len(opens), len(highs), len(lows), len(closes))):
             try:
@@ -224,7 +221,7 @@ def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional
     except Exception:
         return None
 
-# ============ АЛИАСЫ (индексы/металлы/FX/акции → Bybit) ============
+# ============ ALIASES (индексы/металлы/FX → Bybit) ============
 _ALIAS_TO_BB = {
     # Индексы США
     "ES":"US500USDT","NQ":"US100USDT","YM":"US30USDT","RTY":"US2000USDT",
@@ -244,47 +241,47 @@ _ALIAS_TO_BB = {
 def bb_from_other(sym: str) -> Optional[str]:
     s = (sym or "").upper().strip().replace(" ", "")
     s = s.replace("=F","").replace("=X","").lstrip("^")
-    if s in _ALIAS_TO_BB:
-        return _ALIAS_TO_BB[s]
-    idx_map = {"ES":"US500USDT","NQ":"US100USDT","YM":"US30USDT","RTY":"US2000USDT","DX":"DXYUSDT","VIX":"VIXUSDT",
-               "GSPC":"US500USDT","NDX":"US100USDT","DJI":"US30USDT","RUT":"US2000USDT"}
-    if s in idx_map:
-        return idx_map[s]
-    if s.isalpha() and 1 < len(s) <= 6:
-        return s + "USDT"  # токен-акции
-    return None
+    return _ALIAS_TO_BB.get(s)
 
-# ============ ROUTER ============
-def _is_bybit_symbol(sym: str) -> bool:
-    su = (sym or "").upper().strip()
-    return (su in _BB_LINEAR) or (su in _BB_INVERSE)
-
-def fetch_klines(sym: str, interval: str) -> Tuple[Optional[List[List[float]]], Optional[str]]:
+# ============ CRYPTO ROUTER (PERP→SPOT→YF) ============
+def _choose_crypto_symbol(base: str) -> Tuple[str, str]:
     """
-    Порядок: Bybit → Yahoo. Возврат: (klines, src) где src ∈ {"BB","YF",None}
+    Вернёт (kind, name):
+      kind ∈ {"BB_LINEAR","BB_SPOT","YF_SPOT"}
+      name = символ для запроса свечей
     """
-    su = (sym or "").upper().strip()
+    # 1) Bybit PERP (linear): BTCUSDT, но иногда Bybit даёт LTCPERP — нормализуем
+    linear = base + "USDT"
+    perp_alt = base + "PERP"
+    if linear in _BB_LINEAR:
+        return "BB_LINEAR", linear
+    if perp_alt in _BB_LINEAR:
+        return "BB_LINEAR", perp_alt
 
-    if _is_bybit_symbol(su):
-        data = fetch_bybit_klines(su, interval)
-        if data: return data, "BB"
-        yproxy = su.replace("USDT","-USD")
-        data = fetch_yahoo_klines(yproxy, interval)
-        if data: return data, "YF"
-        return None, None
+    # 2) Bybit SPOT
+    spot = base + "USDT"
+    if spot in _BB_SPOT:
+        return "BB_SPOT", spot
 
-    bb = bb_from_other(su)
-    if bb and _is_bybit_symbol(bb):
-        data = fetch_bybit_klines(bb, interval)
-        if data: return data, "BB"
+    # 3) Yahoo spot
+    return "YF_SPOT", f"{base}-USD"
 
-    data = fetch_yahoo_klines(su, interval)
-    if data: return data, "YF"
-    return None, None
+def fetch_crypto_klines(base: str, interval: str) -> Tuple[Optional[List[List[float]]], Optional[str], Optional[str]]:
+    kind, name = _choose_crypto_symbol(base)
+    if kind == "BB_LINEAR":
+        data = fetch_bybit_klines(name, interval, category="linear")
+        return data, "BB", name
+    if kind == "BB_SPOT":
+        data = fetch_bybit_klines(name, interval, category="spot")
+        return data, "BB", name
+    data = fetch_yahoo_klines(name, interval)
+    return data, "YF", name
 
 # ============ DISPLAY (BASE-USDT) ============
 def _to_usdt_display(sym: str) -> str:
     s = (sym or "").upper().strip()
+    if s.endswith("PERP"):  # LTCPERP → LTC-USDT
+        return f"{s[:-4]}-USDT"
     if s.endswith("USDT") and "-" not in s:
         return f"{s[:-4]}-USDT"
     if s.endswith("-USD"):
@@ -292,11 +289,6 @@ def _to_usdt_display(sym: str) -> str:
     if s.endswith("-USDT"):
         return s
     if s.endswith("USD") and "-" not in s and len(s) > 3:
-        fx = {"USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD","MXN","CNY","HKD","SGD",
-              "SEK","NOK","DKK","ZAR","TRY","PLN","CZK","HUF","ILS","KRW","TWD","THB","INR","BRL","RUB","AED","SAR"}
-        letters = "".join(ch for ch in s if ch.isalpha())
-        if len(letters) == 6 and letters[:3] in fx and letters[3:6] in fx:
-            return s
         return s[:-3] + "-USDT"
     return s
 
@@ -307,110 +299,125 @@ def format_signal(symbol: str, sig: str, zone: Optional[str], src: str) -> str:
     disp = _to_usdt_display(symbol)
     return f"{disp} {src_tag} {arrow}{status}".strip()
 
-# ============ SCAN UNIVERSE ============
-STATIC_YF: List[str] = [
-    "IMOEX.ME","RTSI.ME","RF"
-]
+# ============ SCAN LIST ============
+# Yahoo запас: РФ или иные, которые точно не на Bybit
+STATIC_YF: List[str] = ["IMOEX.ME","RTSI.ME","RF"]
 
-SCAN_SYMBOLS: List[str] = []
+CRYPTO_BASES = ALLOWED_CRYPTO  # только 15 мейджоров
+OTHER_BYBIT_SYMBOLS: Set[str] = set()  # индексы/металлы/FX (из _ALIAS_TO_BB значений)
 
-def _is_crypto_symbol(sym: str) -> bool:
-    """Определяем крипто-перп по каталогу Bybit: quote=USDT и base ∈ ALLOWED_BASES или вообще крипта."""
-    info = _BB_INFO.get(sym)
-    if not info: 
-        return False
-    return (info.get("quote") == "USDT") and bool(info.get("base"))
-
-def _is_allowed_crypto(sym: str) -> bool:
-    info = _BB_INFO.get(sym) or {}
-    base = (info.get("base") or "")
-    return (sym in ALLOWED_CRYPTO) or (base in ALLOWED_BASES and info.get("quote") == "USDT")
-
-def rebuild_scan_universe() -> None:
+def rebuild_scan_universe() -> List[Tuple[str, str]]:
     """
-    Сканируем:
-      - ТОЛЬКО 15 crypto majors (по baseCoin/quoteCoin);
-      - Все НЕ-крипто инструменты Bybit (индексы/металлы/FX/токен-акции);
-      - Плюс STATIC_YF.
+    Возвращает список (kind, name):
+      kind ∈ {"CRYPTO","BYBIT_OTHER","YF_ONLY"}
+    CRYPTO — база (BTC/ETH/…): будет PERP→SPOT→YF.
+    BYBIT_OTHER — прямые bybit-символы (индексы/металлы/FX).
+    YF_ONLY — статические YF тикеры.
     """
-    global SCAN_SYMBOLS
-    seeds: List[str] = []
+    global OTHER_BYBIT_SYMBOLS
+    OTHER_BYBIT_SYMBOLS = set(_ALIAS_TO_BB.values())  # US500USDT, XAUUSDT, ...
 
-    bb_all = sorted(_BB_LINEAR | _BB_INVERSE)
-
-    # 1) 15 crypto majors только
-    for s in bb_all:
-        if _is_allowed_crypto(s):
-            seeds.append(s)
-
-    # 2) Не-крипта: включаем всё остальное, что не крипта
-    for s in bb_all:
-        if _is_crypto_symbol(s):
-            # крипта, но не в разрешённых — пропускаем
-            if not _is_allowed_crypto(s):
-                continue
-        else:
-            seeds.append(s)
-
-    # 3) Добавить статические YF-символы
-    seen = set(seeds)
+    items: List[Tuple[str, str]] = []
+    # 1) Крипта: 15 баз
+    for b in CRYPTO_BASES:
+        items.append(("CRYPTO", b))
+    # 2) Индексы/металлы/FX с Bybit, если реально есть в каталоге
+    bb_all = set(_BB_LINEAR) | set(_BB_SPOT)
+    for sym in sorted(OTHER_BYBIT_SYMBOLS):
+        if sym in bb_all:
+            items.append(("BYBIT_OTHER", sym))
+    # 3) YF-only
     for y in STATIC_YF:
-        if y.upper() not in seen:
-            seeds.append(y)
-
-    # Уникализация
-    uniq=set(); out=[]
-    for s in seeds:
-        su = s.upper()
-        if su in uniq: continue
-        uniq.add(su); out.append(s)
-    SCAN_SYMBOLS = out
+        items.append(("YF_ONLY", y))
+    return items
 
 # ============ CORE ============
-def process_symbol(sym: str) -> bool:
-    try:
-        k4, s4 = fetch_klines(sym, KLINE_4H)
-        k1, s1 = fetch_klines(sym, KLINE_1D)
-        if not k4 or not k1:
-            return False
-
-        src = "BB" if (s4=="BB" or s1=="BB") else "YF"
-
-        d4 = demarker_series(k4, DEM_LEN)
-        d1 = demarker_series(k1, DEM_LEN)
-        if not d4 or not d1:
-            return False
-
-        v4 = last_closed(d4); v1 = last_closed(d1)
-        z4 = zone_of(v4);     z1 = zone_of(v1)
-
-        open4 = k4[-2][0]; open1 = k1[-2][0]
-        dual_bar_id = max(open4, open1)
-
-        if z4 and z1 and z4 == z1:
-            sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
-            key = f"{sym}|{src}|{sig}|{z4}|{dual_bar_id}"
-            return _broadcast_signal(format_signal(sym, sig, z4, src), key)
-
-        if z4 and not z1 and candle_pattern(k4):
-            key = f"{sym}|{src}|1TF+CAN@4H|{z4}|{open4}"
-            return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, src), key)
-
-        if z1 and not z4 and candle_pattern(k1):
-            key = f"{sym}|{src}|1TF+CAN@1D|{z1}|{open1}"
-            return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, src), key)
-
+def process_crypto(base: str) -> bool:
+    k4, s4, name4 = fetch_crypto_klines(base, KLINE_4H)
+    k1, s1, name1 = fetch_crypto_klines(base, KLINE_1D)
+    if not k4 or not k1: 
         return False
-    except Exception:
-        return False
+    src = "BB" if (s4=="BB" or s1=="BB") else "YF"
+    d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
+    if not d4 or not d1: return False
+    v4 = last_closed(d4); v1 = last_closed(d1)
+    z4 = zone_of(v4);     z1 = zone_of(v1)
+    open4 = k4[-2][0]; open1 = k1[-2][0]
+    dual_bar_id = max(open4, open1)
+
+    sym_for_key = (name4 or name1 or base)
+    if z4 and z1 and z4 == z1:
+        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+        key = f"{sym_for_key}|{src}|{sig}|{z4}|{dual_bar_id}"
+        return _broadcast_signal(format_signal(sym_for_key, sig, z4, src), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym_for_key}|{src}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym_for_key, "1TF+CAN", z4, src), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym_for_key}|{src}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym_for_key, "1TF+CAN", z1, src), key)
+    return False
+
+def process_bybit_other(sym: str) -> bool:
+    # всегда Bybit linear (если есть), иначе Yahoo по прокси имени
+    k4 = fetch_bybit_klines(sym, KLINE_4H, category="linear") or fetch_yahoo_klines(sym.replace("USDT","-USD"), KLINE_4H)
+    k1 = fetch_bybit_klines(sym, KLINE_1D, category="linear") or fetch_yahoo_klines(sym.replace("USDT","-USD"), KLINE_1D)
+    if not k4 or not k1: return False
+    src = "BB" if isinstance(k4[0][0], int) and isinstance(k1[0][0], int) and sym in _BB_LINEAR else "YF"
+    d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
+    if not d4 or not d1: return False
+    v4 = last_closed(d4); v1 = last_closed(d1)
+    z4 = zone_of(v4);     z1 = zone_of(v1)
+    open4 = k4[-2][0]; open1 = k1[-2][0]
+    dual_bar_id = max(open4, open1)
+
+    if z4 and z1 and z4 == z1:
+        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+        key = f"{sym}|{src}|{sig}|{z4}|{dual_bar_id}"
+        return _broadcast_signal(format_signal(sym, sig, z4, src), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym}|{src}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, src), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym}|{src}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, src), key)
+    return False
+
+def process_yf_only(sym: str) -> bool:
+    k4 = fetch_yahoo_klines(sym, KLINE_4H)
+    k1 = fetch_yahoo_klines(sym, KLINE_1D)
+    if not k4 or not k1: return False
+    d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
+    if not d4 or not d1: return False
+    v4 = last_closed(d4); v1 = last_closed(d1)
+    z4 = zone_of(v4);     z1 = zone_of(v1)
+    open4 = k4[-2][0]; open1 = k1[-2][0]
+    dual_bar_id = max(open4, open1)
+    src = "YF"
+    if z4 and z1 and z4 == z1:
+        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+        key = f"{sym}|{src}|{sig}|{z4}|{dual_bar_id}"
+        return _broadcast_signal(format_signal(sym, sig, z4, src), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym}|{src}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, src), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym}|{src}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, src), key)
+    return False
 
 def main():
     while True:
         refresh_bybit_instruments()
-        rebuild_scan_universe()
+        plan = rebuild_scan_universe()
 
-        for s in SCAN_SYMBOLS:
-            process_symbol(s)
+        for kind, name in plan:
+            if kind == "CRYPTO":
+                process_crypto(name)        # name = base (BTC/ETH/…)
+            elif kind == "BYBIT_OTHER":
+                process_bybit_other(name)   # name = bybit symbol (US500USDT, XAUUSDT, …)
+            else:
+                process_yf_only(name)       # name = YF symbol (IMOEX.ME, RF, …)
             time.sleep(1)
 
         gc_state(STATE, 21)
