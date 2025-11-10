@@ -1,24 +1,25 @@
-# bot.py — DeMarker-28h Bybit + Yahoo Edition (без Russell)
-# clean: только сигналы, без логов, 60-минутное обновление
+# bot.py — Bybit primary → Yahoo fallback; 15 crypto majors; commodities/indices/FX/xStocks; no Russell; group-only
 
 import os, time, json, requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Set
 
-# ============ CONFIG ============
+# ===== ENV / CONFIG =====
 STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-DEM_LEN  = 28
-DEM_OB   = 0.70
-DEM_OS   = 0.30
-POLL_HOURS = 1
-POLL_SECONDS = POLL_HOURS * 3600
+DEM_LEN  = int(os.getenv("DEM_LEN", "28"))
+DEM_OB   = float(os.getenv("DEM_OB", "0.70"))
+DEM_OS   = float(os.getenv("DEM_OS", "0.30"))
+KLINE_4H = os.getenv("KLINE_4H", "4h")
+KLINE_1D = os.getenv("KLINE_1D", "1d")
+POLL_HRS = int(os.getenv("POLL_HOURS", "1"))
+POLL_SECONDS = POLL_HRS * 3600
 
-TELEGRAM_GROUP_ONLY = True  # только группа
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ============ STATE ============
+# ===== STATE =====
 def load_state(path: str) -> Dict:
     try:
         with open(path, "r") as f:
@@ -49,16 +50,13 @@ def gc_state(state: Dict, days: int = 21) -> None:
 
 STATE = load_state(STATE_PATH)
 
-# ============ TELEGRAM ============
+# ===== TELEGRAM (group-only) =====
 def _chat_tokens() -> List[str]:
     raw = (TELEGRAM_CHAT or "").strip()
     if not raw:
         return []
     toks = [x.strip() for x in raw.split(",") if x.strip()]
-    toks = [t for t in toks if (t.startswith("-100") or (t.startswith("-") and t[1:].isdigit()))]
-    if TELEGRAM_GROUP_ONLY:
-        toks = [t for t in toks if t.startswith("-100")]
-    return toks
+    return [t for t in toks if t.startswith("-100")]
 
 def tg_send_one(cid: str, text: str) -> bool:
     try:
@@ -82,7 +80,7 @@ def _broadcast_signal(text: str, signal_key: str) -> bool:
             sent_any = True
     return sent_any
 
-# ============ INDICATORS ============
+# ===== INDICATORS (без упоминаний в сообщениях) =====
 def demarker_series(ohlc: List[List[float]], length: int) -> Optional[List[Optional[float]]]:
     if not ohlc or len(ohlc) < length + 2:
         return None
@@ -131,121 +129,291 @@ def candle_pattern(ohlc):
     if not ohlc or len(ohlc)<4: return False
     return wick_ge_body_pct(ohlc,-2,0.25) or engulfing_with_prior(ohlc,-2)
 
-# === NORMALIZE SYMBOL ===
-def normalize_symbol(raw: str) -> str:
-    s = (raw or "").upper().strip()
-    s = s.replace("=F", "").replace("=X", "")
-    s = s.replace("/", "-")
-    if s.startswith("^"):
-        s = s[1:]
-    s = s.replace(" ", "")
-    FX = {
-        "USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD","MXN","CNY","HKD","SGD",
-        "SEK","NOK","DKK","ZAR","TRY","PLN","CZK","HUF","ILS","KRW","TWD","THB",
-        "INR","BRL","RUB","AED","SAR"
-    }
-    letters = "".join(ch for ch in s if ch.isalpha())
-    is_fx = len(letters) >= 6 and letters[:3] in FX and letters[3:6] in FX
-    if is_fx:
-        return letters[:6] + "-USD"
-    core = s.split("-")[0]
-    return core + "-USDT"
+# ===== BYBIT API =====
+BYBIT_BASE   = os.getenv("BYBIT_BASE", "https://api.bybit.com")
+BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
+BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
+BB_TIMEOUT   = 15
 
-def format_signal(symbol: str, sig: str, zone: Optional[str]) -> str:
-    arrow="🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
-    status="⚡" if sig=="LIGHT" else ("⚡🕯️" if sig=="L+CAN" else "🕯️")
-    return f"{normalize_symbol(symbol)} {arrow}{status}"
+_BB_LINEAR: Set[str] = set()  # PERP
+_BB_SPOT:   Set[str] = set()
 
-# ============ SYMBOL UNIVERSE ============
-YF_SYMBOLS = [
-    # === CRYPTO ===
-    "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","DOGE-USD","AVAX-USD","DOT-USD","LINK-USD",
-    "LTC-USD","MATIC-USD","TON-USD","ATOM-USD","NEAR-USD","FIL-USD","AAVE-USD","XMR-USD","LDO-USD","INJ-USD",
-    # === FUTURES ===
-    "ES=F","NQ=F","YM=F","VX=F","DX=F",
-    "GC=F","SI=F","HG=F","PL=F","PA=F","CL=F","BZ=F","NG=F","RB=F","HO=F",
-    "ZC=F","ZS=F","ZW=F","KC=F","SB=F","CC=F","6E=F","6J=F","6B=F","6A=F","6C=F","6S=F","BTC=F","ETH=F",
-    # === FX ===
-    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","NZDUSD=X","USDCAD=X","USDCHF=X",
-    # === INDICES (без Russell) ===
-    "^GSPC","^NDX","^DJI","^VIX","^FTSE","^GDAXI","^FCHI","^STOXX50E","^HSI","^N225","^AORD","^SPTSX","^BSESN","^SHCOMP",
-    "IMOEX.ME","RTSI.ME",
-    # === US STOCKS ===
-    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","BRK-B","AVGO","JNJ","JPM","V","MA","UNH","HD","LLY","XOM","KO","PEP",
-    # === RUSSIAN STOCKS ===
-    "GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME","ALRS.ME","GMKN.ME","YNDX.ME","POLY.ME",
-    "MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME","PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
-]
+def refresh_bybit_instruments():
+    global _BB_LINEAR, _BB_SPOT
+    _BB_LINEAR=set(); _BB_SPOT=set()
+    try:
+        r = requests.get(BB_INSTR_EP, params={"category":"linear"}, timeout=BB_TIMEOUT)
+        if r.status_code == 200:
+            for it in (r.json().get("result") or {}).get("list") or []:
+                sym = str(it.get("symbol","")).upper().strip()
+                _BB_LINEAR.add(sym)
+        r = requests.get(BB_INSTR_EP, params={"category":"spot"}, timeout=BB_TIMEOUT)
+        if r.status_code == 200:
+            for it in (r.json().get("result") or {}).get("list") or []:
+                sym = str(it.get("symbol","")).upper().strip()
+                _BB_SPOT.add(sym)
+    except Exception:
+        pass
 
-# ============ FETCH (Yahoo) ============
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-def fetch_yahoo_klines(symbol: str, interval: str, limit: int = 200) -> Optional[List[List[float]]]:
+def fetch_bybit_klines(symbol: str, interval: str, category: str, limit: int = 600) -> Optional[List[List[float]]]:
+    iv = "240" if interval == "4h" else ("D" if interval.lower()=="1d" else interval)
+    try:
+        r = requests.get(BB_KLINES_EP, params={"category":category,"symbol":symbol,"interval":iv,"limit":str(limit)}, timeout=BB_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        lst = (r.json().get("result") or {}).get("list") or []
+        if not lst:
+            return None
+        out=[]
+        for k in lst:
+            ts = int(k[0]); ts = ts//1000 if ts>10**12 else ts
+            o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4])
+            if h<=0 or l<=0: continue
+            out.append([ts,o,h,l,c])
+        out.sort(key=lambda x:x[0])
+        return out if out else None
+    except Exception:
+        return None
+
+# ===== YAHOO =====
+def fetch_yahoo_klines(symbol: str, interval: str) -> Optional[List[List[float]]]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": interval, "range": "180d"}
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        if r.status_code != 200: return None
-        chart = r.json().get("chart", {})
-        results = chart.get("result", [])
-        if not results: return None
-        j = results[0]
+        if r.status_code != 200:
+            return None
+        j = (r.json().get("chart") or {}).get("result") or []
+        if not j:
+            return None
+        j = j[0]
         ts = j.get("timestamp") or []
-        ind = j.get("indicators", {}).get("quote", [])
-        if not ts or not ind: return None
-        q = ind[0]
+        q = ((j.get("indicators") or {}).get("quote") or [{}])[0]
         opens, highs, lows, closes = q.get("open"), q.get("high"), q.get("low"), q.get("close")
-        if not (opens and highs and lows and closes): return None
+        if not (ts and opens and highs and lows and closes):
+            return None
         out=[]
         for i in range(min(len(ts), len(opens), len(highs), len(lows), len(closes))):
             try:
                 o=float(opens[i]); h=float(highs[i]); l=float(lows[i]); c=float(closes[i])
                 if h<=0 or l<=0: continue
                 out.append([int(ts[i]),o,h,l,c])
-            except Exception: 
+            except Exception:
                 continue
         return out if out else None
     except Exception:
         return None
 
-# ============ CORE ============
-def process_symbol(sym: str) -> bool:
-    try:
-        k4 = fetch_yahoo_klines(sym,"4h")
-        k1 = fetch_yahoo_klines(sym,"1d")
-        if not k4 or not k1: 
-            return False
+# ===== UNIVERSE / ALIASES =====
+# 15 крипто-мажоров (база)
+CRYPTO_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX","DOT","LINK","LTC","MATIC","TON","ATOM","NEAR"]
 
-        d4 = demarker_series(k4, DEM_LEN)
-        d1 = demarker_series(k1, DEM_LEN)
-        if not d4 or not d1: 
-            return False
+# индексы/металлы/энергия/FX → Bybit символы (без Russell)
+ALIAS_TO_BB = {
+    # US indices
+    "ES":"US500USDT","^GSPC":"US500USDT",
+    "NQ":"US100USDT","^NDX":"US100USDT",
+    "YM":"US30USDT","^DJI":"US30USDT",
+    "VIX":"VIXUSDT","DX":"DXYUSDT",
+    # Global indices
+    "DE40":"DE40USDT","FR40":"FR40USDT","UK100":"UK100USDT","JP225":"JP225USDT",
+    "HK50":"HK50USDT","CN50":"CN50USDT","AU200":"AU200USDT","ES35":"ES35USDT","IT40":"IT40USDT",
+    # Metals / Energy
+    "GC":"XAUUSDT","SI":"XAGUSDT","HG":"XCUUSDT","PL":"XPTUSDT","PA":"XPDUSDT",
+    "CL":"OILUSDT","BZ":"BRENTUSDT","NG":"GASUSDT",
+    # FX (если есть у Bybit)
+    "EURUSD":"EURUSD","GBPUSD":"GBPUSD","USDJPY":"USDJPY","AUDUSD":"AUDUSD","NZDUSD":"NZDUSD",
+    "USDCAD":"USDCAD","USDCHF":"USDCHF",
+}
 
-        v4 = last_closed(d4); v1 = last_closed(d1)
-        z4 = zone_of(v4);   z1 = zone_of(v1)
-        open4 = k4[-2][0]; open1 = k1[-2][0]
-        dual_bar_id = max(open4, open1)
+# токен-акции Bybit (дополни при необходимости)
+TOKEN_STOCKS = {
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRKB","AVGO","NFLX","AMD",
+    "JPM","V","MA","UNH","LLY","XOM","KO","PEP"
+}
 
-        if z4 and z1 and z4 == z1:
-            sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
-            key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
-            return _broadcast_signal(format_signal(sym, sig, z4), key)
+# РФ индексы/акции — Yahoo (если нет на Bybit)
+YF_ONLY_DEFAULT = [
+    "IMOEX.ME","RTSI.ME",
+    "GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME","ALRS.ME","GMKN.ME","YNDX.ME",
+    "MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME","PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
+]
 
-        if z4 and not z1 and candle_pattern(k4):
-            key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
-            return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+def bybit_symbol_for_alias(sym: str) -> Optional[str]:
+    s = (sym or "").upper().strip().replace(" ", "")
+    s = s.replace("=F","").replace("=X","").lstrip("^")
+    if s in ALIAS_TO_BB:
+        return ALIAS_TO_BB[s]
+    s_norm = s.replace(".", "")  # BRK.B -> BRKB
+    if s_norm in TOKEN_STOCKS:
+        return s_norm + "USDT"
+    return None
 
-        if z1 and not z4 and candle_pattern(k1):
-            key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
-            return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+# ===== DISPLAY (без источников) =====
+def to_usdt_display(sym: str) -> str:
+    s = (sym or "").upper().strip()
+    if s.endswith("PERP"):
+        return f"{s[:-4]}-USDT"
+    if s.endswith("USDT") and "-" not in s:
+        return f"{s[:-4]}-USDT"
+    if s.endswith("-USD"):
+        return s[:-4] + "-USDT"
+    if s.endswith("-USDT"):
+        return s
+    if s.endswith("USD") and "-" not in s and len(s)>3:
+        return s[:-3] + "-USDT"
+    return s
 
+def format_signal(symbol: str, sig: str, zone: Optional[str]) -> str:
+    arrow  = "🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
+    status = "⚡" if sig=="LIGHT" else ("⚡🕯️" if sig=="L+CAN" else "🕯️")
+    return f"{to_usdt_display(symbol)} {arrow}{status}".strip()
+
+# ===== FETCH ROUTERS =====
+def fetch_crypto(base: str, interval: str) -> Tuple[Optional[List[List[float]]], str]:
+    # 1) Bybit PERP
+    bb_linear = base + "USDT"
+    bb_perp_alt = base + "PERP"
+    if bb_linear in _BB_LINEAR:
+        d = fetch_bybit_klines(bb_linear, interval, "linear")
+        if d: return d, bb_linear
+    if bb_perp_alt in _BB_LINEAR:
+        d = fetch_bybit_klines(bb_perp_alt, interval, "linear")
+        if d: return d, bb_perp_alt
+    # 2) Bybit SPOT
+    bb_spot = base + "USDT"
+    if bb_spot in _BB_SPOT:
+        d = fetch_bybit_klines(bb_spot, interval, "spot")
+        if d: return d, bb_spot
+    # 3) Yahoo SPOT
+    return fetch_yahoo_klines(f"{base}-USD", interval), f"{base}-USD"
+
+def fetch_other(symbol_hint: str, interval: str) -> Tuple[Optional[List[List[float]]], str]:
+    """
+    commodities/indices/FX/xStocks:
+    сначала Bybit (linear), иначе Yahoo (-USD или *.ME)
+    """
+    bb = bybit_symbol_for_alias(symbol_hint) or symbol_hint
+    bb = bb.upper()
+
+    # Bybit linear
+    if bb in _BB_LINEAR:
+        d = fetch_bybit_klines(bb, interval, "linear")
+        if d: return d, bb
+
+    # Yahoo proxy
+    yf = bb
+    if yf.endswith(".ME"):
+        # РФ тикеры уже корректные для Yahoo
+        pass
+    elif "USDT" in yf and "-" not in yf:
+        yf = yf.replace("USDT", "-USD")
+    elif "-" not in yf:
+        yf = yf + "-USD"
+
+    return fetch_yahoo_klines(yf, interval), yf
+
+# ===== PLAN =====
+def build_plan() -> List[Tuple[str, str]]:
+    plan: List[Tuple[str,str]] = []
+    # 1) Крипта 15 мажоров
+    for b in CRYPTO_BASES:
+        plan.append(("CRYPTO", b))
+    # 2) Индексы/металлы/энергия/FX/токен-акции
+    keys = sorted(set(list(ALIAS_TO_BB.keys()) + list(TOKEN_STOCKS)))
+    for k in keys:
+        plan.append(("OTHER", k))
+    # 3) РФ блок (Yahoo)
+    for y in YF_ONLY_DEFAULT:
+        plan.append(("YF_ONLY", y))
+    return plan
+
+# ===== CORE =====
+def process_crypto(base: str) -> bool:
+    k4, name4 = fetch_crypto(base, KLINE_4H)
+    k1, name1 = fetch_crypto(base, KLINE_1D)
+    if not k4 or not k1:
         return False
-    except Exception:
+    d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
+    if not d4 or not d1:
         return False
+    v4 = last_closed(d4); v1 = last_closed(d1)
+    z4 = zone_of(v4); z1 = zone_of(v1)
+    open4 = k4[-2][0]; open1 = k1[-2][0]
+    dual_bar_id = max(open4, open1)
+    sym = name4 or name1 or base
+    if z4 and z1 and z4==z1:
+        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+        key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
+        return _broadcast_signal(format_signal(sym, sig, z4), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+    return False
+
+def process_other(hint: str) -> bool:
+    k4, name4 = fetch_other(hint, KLINE_4H)
+    k1, name1 = fetch_other(hint, KLINE_1D)
+    if not k4 or not k1:
+        return False
+    d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
+    if not d4 or not d1:
+        return False
+    v4 = last_closed(d4); v1 = last_closed(d1)
+    z4 = zone_of(v4); z1 = zone_of(v1)
+    open4 = k4[-2][0]; open1 = k1[-2][0]
+    dual_bar_id = max(open4, open1)
+    sym = name4 or name1 or hint
+    if z4 and z1 and z4==z1:
+        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+        key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
+        return _broadcast_signal(format_signal(sym, sig, z4), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+    return False
+
+def process_yf_only(sym: str) -> bool:
+    k4 = fetch_yahoo_klines(sym, KLINE_4H)
+    k1 = fetch_yahoo_klines(sym, KLINE_1D)
+    if not k4 or not k1:
+        return False
+    d4 = demarker_series(k4, DEM_LEN); d1 = demarker_series(k1, DEM_LEN)
+    if not d4 or not d1:
+        return False
+    v4 = last_closed(d4); v1 = last_closed(d1)
+    z4 = zone_of(v4); z1 = zone_of(v1)
+    open4 = k4[-2][0]; open1 = k1[-2][0]
+    dual_bar_id = max(open4, open1)
+    if z4 and z1 and z4==z1:
+        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
+        key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
+        return _broadcast_signal(format_signal(sym, sig, z4), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1), key)
+    return False
 
 def main():
     while True:
-        for s in YF_SYMBOLS:
-            process_symbol(s)
+        refresh_bybit_instruments()
+        plan = build_plan()
+        for kind, name in plan:
+            if kind == "CRYPTO":
+                process_crypto(name)
+            elif kind == "OTHER":
+                process_other(name)
+            else:
+                process_yf_only(name)
             time.sleep(1)
         gc_state(STATE, 21)
         save_state(STATE_PATH, STATE)
