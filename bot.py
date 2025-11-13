@@ -150,7 +150,7 @@ def candle_pattern(ohlc):
 # ===== BYBIT API =====
 BYBIT_BASE   = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
-BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"}
+BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT   = 15
 
 _BB_LINEAR: Set[str] = set()  # PERP (linear)
@@ -455,12 +455,12 @@ def process_yf_only(sym: str) -> bool:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
         return _broadcast_signal(format_signal(sym, sig, z4, tag), key)
-    if z4 and not з1 and candle_pattern(k4):
-        key = f"{sym}|1TF+CAN@4H|{з4}|{open4}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", з4, tag), key)
-    if з1 and not z4 and candle_pattern(k1):
-        key = f"{sym}|1TF+CAN@1D|{з1}|{open1}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", з1, tag), key)
+    if z4 and not z1 and candle_pattern(k4):
+        key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, tag), key)
+    if z1 and not z4 and candle_pattern(k1):
+        key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, tag), key)
     return False
 
 def main():
