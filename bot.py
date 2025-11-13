@@ -1,9 +1,13 @@
 # bot.py — Bybit + TwelveData (crypto/FX/indices/stocks/RU .ME); 4H+1D
-# Только закрытые свечи, DeMarker(28), wick>=25%, engulfing, сигналы LIGHT / L+CAN / 1TF+CAN
+# Только закрытые свечи, DeMarker(28), wick>=25%, engulfing
+# Сигналы:
+#   ⚡ / ⚡🕯️  — совпадение 4H и 1D
+#   1TF4H     — 4H + свечной паттерн
+#   1TF1D     — 1D + свечной паттерн
 
 import os, time, json, requests
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # ================= CONFIG =====================
 
@@ -53,17 +57,17 @@ STATE = load_state(STATE_PATH)
 
 # ================= TELEGRAM =====================
 
-def _chat_tokens():
+def _chat_tokens() -> List[str]:
     if not TELEGRAM_CHAT:
         return []
-    out = []
+    out: List[str] = []
     for x in TELEGRAM_CHAT.split(","):
         x = x.strip()
         if x:
             out.append(x)
     return out
 
-def tg_send_one(cid, text):
+def tg_send_one(cid: str, text: str) -> bool:
     try:
         r = requests.post(
             f"{TG_API}/sendMessage",
@@ -74,7 +78,7 @@ def tg_send_one(cid, text):
     except:
         return False
 
-def _broadcast_signal(text, signal_key):
+def _broadcast_signal(text: str, signal_key: str) -> bool:
     chats = _chat_tokens()
     if not TELEGRAM_TOKEN or not chats:
         return False
@@ -91,14 +95,14 @@ def _broadcast_signal(text, signal_key):
 
 # ================= CLOSE BARS =====================
 
-def closed_ohlc(ohlc):
+def closed_ohlc(ohlc: Optional[List[List[float]]]) -> List[List[float]]:
     if not ohlc or len(ohlc) < 2:
         return []
     return ohlc[:-1]
 
 # ================= INDICATORS =====================
 
-def demarker_series(ohlc, length):
+def demarker_series(ohlc: List[List[float]], length: int):
     if not ohlc or len(ohlc) < length + 1:
         return None
     highs = [x[2] for x in ohlc]
@@ -134,8 +138,10 @@ def zone_of(v):
         return "OS"
     return None
 
-def wick_ge_body_pct(o, idx, pct=0.25):
+def wick_ge_body_pct(o: List[List[float]], idx: int, pct=0.25) -> bool:
     if not o:
+        return False
+    if not (-len(o) <= idx < len(o)):
         return False
     o_, h_, l_, c_ = o[idx][1:5]
     body = abs(c_ - o_)
@@ -145,7 +151,7 @@ def wick_ge_body_pct(o, idx, pct=0.25):
     lower = min(o_, c_) - l_
     return (upper >= pct*body) or (lower >= pct*body)
 
-def engulfing_with_prior4(o):
+def engulfing_with_prior4(o: List[List[float]]) -> bool:
     if not o or len(o) < 3:
         return False
     o2, h2, l2, c2 = o[-1][1:5]
@@ -159,7 +165,7 @@ def engulfing_with_prior4(o):
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
 
-def candle_pattern(ohlc):
+def candle_pattern(ohlc: List[List[float]]) -> bool:
     o = closed_ohlc(ohlc)
     if len(o) < 3:
         return False
@@ -192,7 +198,7 @@ BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 BB_KLINES  = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT = 15
 
-def fetch_bybit_klines(symbol, interval, category, limit=600):
+def fetch_bybit_klines(symbol: str, interval: str, category: str, limit=600):
     iv = "240" if interval == "4h" else ("D" if interval == "1d" else interval)
     try:
         r = requests.get(
@@ -217,7 +223,7 @@ def fetch_bybit_klines(symbol, interval, category, limit=600):
 
 # ================= TWELVEDATA =====================
 
-def fetch_twelvedata_klines(symbol, interval, limit=500):
+def fetch_twelvedata_klines(symbol: str, interval: str, limit=500):
     if not TWELVE_API_KEY:
         return None
     td_iv = "4h" if interval == "4h" else "1day"
@@ -285,7 +291,6 @@ STOCKS = [
     "AVGO","NFLX","AMD","JPM","V","MA","UNH","LLY","XOM","KO","PEP"
 ]
 
-# Российские акции/индексы — через TwelveData, тикеры .ME
 RU_STOCKS = [
     "IMOEX.ME","RTSI.ME","GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME",
     "ALRS.ME","GMKN.ME","YNDX.ME","MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME",
@@ -298,10 +303,10 @@ FX = [
 
 # ================= FETCH ROUTERS =====================
 
-def fx_to_td(sym):
+def fx_to_td(sym: str) -> str:
     return sym[:3] + "/" + sym[3:]
 
-def fetch_crypto(base, interval):
+def fetch_crypto(base: str, interval: str):
     bb_lin = base + "USDT"
     d = fetch_bybit_klines(bb_lin, interval, "linear")
     if d:
@@ -319,19 +324,16 @@ def fetch_crypto(base, interval):
     td = base + "/USD"
     return fetch_twelvedata_klines(td, interval), td, "TD"
 
-def fetch_other(sym, interval):
-    # Bybit USDT-перпы/CFD
+def fetch_other(sym: str, interval: str):
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
 
-    # FX по ISO
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         td = fx_to_td(sym)
         return fetch_twelvedata_klines(td, interval), td, "TD"
 
-    # Всё остальное (включая .ME) — напрямую в TwelveData
     return fetch_twelvedata_klines(sym, interval), sym, "TD"
 
 # ================= PLAN =====================
@@ -349,7 +351,8 @@ def build_plan():
 
 # ================= CORE =====================
 
-def process_symbol(kind, name):
+def process_symbol(kind: str, name: str) -> bool:
+    # грузим оба таймфрейма, но 1TF-сигналы могут работать и по одному
     if kind == "CRYPTO":
         k4_raw, n4, s4 = fetch_crypto(name, KLINE_4H)
         k1_raw, n1, s1 = fetch_crypto(name, KLINE_1D)
@@ -357,48 +360,60 @@ def process_symbol(kind, name):
         k4_raw, n4, s4 = fetch_other(name, KLINE_4H)
         k1_raw, n1, s1 = fetch_other(name, KLINE_1D)
 
-    # Оба ТФ должны быть, иначе сигнала нет
-    if not k4_raw or not k1_raw:
+    have4 = bool(k4_raw)
+    have1 = bool(k1_raw)
+    if not have4 and not have1:
         return False
 
-    k4 = closed_ohlc(k4_raw)
-    k1 = closed_ohlc(k1_raw)
-    if not k4 or not k1:
+    k4 = closed_ohlc(k4_raw) if have4 else None
+    k1 = closed_ohlc(k1_raw) if have1 else None
+    if have4 and not k4:
+        have4 = False
+    if have1 and not k1:
+        have1 = False
+    if not have4 and not have1:
         return False
 
-    d4 = demarker_series(k4, DEM_LEN)
-    d1 = demarker_series(k1, DEM_LEN)
-    if d4 is None or d1 is None:
-        return False
+    d4 = demarker_series(k4, DEM_LEN) if have4 else None
+    d1 = demarker_series(k1, DEM_LEN) if have1 else None
 
-    v4 = last_closed(d4)
-    v1 = last_closed(d1)
-    z4 = zone_of(v4)
-    z1 = zone_of(v1)
+    v4 = last_closed(d4) if d4 is not None else None
+    v1 = last_closed(d1) if d1 is not None else None
 
-    open4 = k4[-1][0]
-    open1 = k1[-1][0]
-    dual  = max(open4, open1)
+    z4 = zone_of(v4) if v4 is not None else None
+    z1 = zone_of(v1) if v1 is not None else None
+
+    pat4 = candle_pattern(k4) if have4 else False
+    pat1 = candle_pattern(k1) if have1 else False
+
+    open4 = k4[-1][0] if have4 else None
+    open1 = k1[-1][0] if have1 else None
+    dual  = max([x for x in (open4, open1) if x is not None])
 
     sym = n4 or n1 or name
     src = "BB" if "BB" in (s4, s1) else "TD"
 
-    if z4 and z1 and z4 == z1:
-        sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
-        key = f"{sym}|{sig}|{z4}|{dual}|{src}"
-        return _broadcast_signal(format_signal(sym, sig, z4, src), key)
+    sent = False
 
-    if z4 and not z1 and candle_pattern(k4):
+    # A) Совпадение двух ТФ (4H+1D)
+    if z4 and z1 and z4 == z1:
+        sig = "L+CAN" if (pat4 or pat1) else "LIGHT"
+        key = f"{sym}|{sig}|{z4}|{dual}|{src}"
+        sent |= _broadcast_signal(format_signal(sym, sig, z4, src), key)
+
+    # B) 1TF4H — только 4 часа: крайность + свеча
+    if have4 and z4 and pat4:
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
-        return _broadcast_signal(format_signal(sym, sig, z4, src), key)
+        sent |= _broadcast_signal(format_signal(sym, sig, z4, src), key)
 
-    if z1 and not z4 and candle_pattern(k1):
+    # C) 1TF1D — только день: крайность + свеча
+    if have1 and z1 and pat1:
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
-        return _broadcast_signal(format_signal(sym, sig, z1, src), key)
+        sent |= _broadcast_signal(format_signal(sym, sig, z1, src), key)
 
-    return False
+    return sent
 
 # ================= MAIN =====================
 
