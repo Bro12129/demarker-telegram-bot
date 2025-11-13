@@ -150,7 +150,7 @@ def candle_pattern(ohlc):
 # ===== BYBIT API =====
 BYBIT_BASE   = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 BB_INSTR_EP  = f"{BYBIT_BASE}/v5/market/instruments-info"
-BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"
+BB_KLINES_EP = f"{BYBIT_BASE}/v5/market/kline"}
 BB_TIMEOUT   = 15
 
 _BB_LINEAR: Set[str] = set()  # PERP (linear)
@@ -262,14 +262,44 @@ def is_fx_pair(sym: str) -> bool:
     s = "".join(ch for ch in (sym or "").upper() if ch.isalpha())
     return len(s) >= 6 and s[:3] in FX_ISO and s[3:6] in FX_ISO
 
+def fx_to_yahoo(sym: str) -> str:
+    """
+    Унифицированное преобразование FX-пары в тикер Yahoo:
+    - если базовая валюта = USD (USDJPY) → 'JPY=X'
+    - иначе стандартный формат, как на Yahoo: 'EURUSD=X', 'GBPUSD=X' и т.п.
+    """
+    letters = "".join(ch for ch in (sym or "").upper() if ch.isalpha())
+    if len(letters) < 6:
+        return letters
+    base = letters[:3]
+    quote = letters[3:6]
+    if base == "USD":
+        return f"{quote}=X"
+    return f"{base}{quote}=X"
+
 # ===== DISPLAY =====
 def to_usdt_display(sym: str) -> str:
     s = (sym or "").upper().strip()
-    # FX → PAIR-USD
+    # FX (включая тикеры вида XXXYYY и XXXYYY=X / JPY=X и т.п.)
     if is_fx_pair(s) or s.endswith("=X"):
         letters = "".join(ch for ch in s if ch.isalpha())
-        pair6 = letters[:6] if len(letters)>=6 else letters
-        return f"{pair6}-USD"
+        base = quote = ""
+        if s.endswith("=X"):
+            if len(letters) == 4:
+                # JPY=X, EUR=X → USD/JPY, USD/EUR
+                quote = letters[:3]
+                base = "USD"
+            elif len(letters) >= 6:
+                base = letters[:3]
+                quote = letters[3:6]
+        else:
+            if len(letters) >= 6:
+                base = letters[:3]
+                quote = letters[3:6]
+        if base and quote:
+            return f"{base}{quote}-USD"
+        # fallback, если что-то необычное
+        return letters + "-USD" if letters else s
     # РФ тикеры .ME — как есть
     if s.endswith(".ME"):
         return s
@@ -332,7 +362,7 @@ def fetch_other(symbol_hint: str, interval: str) -> Tuple[Optional[List[List[flo
         return fetch_yahoo_klines(bb, interval), bb, "YF"
 
     if is_fx_pair(bb):
-        yf = "".join(ch for ch in bb if ch.isalpha())[:6] + "=X"
+        yf = fx_to_yahoo(bb)
         return fetch_yahoo_klines(yf, interval), yf, "YF"
 
     if "USDT" in bb and "-" not in bb:
@@ -425,12 +455,12 @@ def process_yf_only(sym: str) -> bool:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual_bar_id}"
         return _broadcast_signal(format_signal(sym, sig, z4, tag), key)
-    if z4 and not z1 and candle_pattern(k4):
+    if z4 and not з1 and candle_pattern(k4):
         key = f"{sym}|1TF+CAN@4H|{з4}|{open4}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z4, tag), key)
-    if z1 and not z4 and candle_pattern(k1):
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", з4, tag), key)
+    if з1 and not z4 and candle_pattern(k1):
         key = f"{sym}|1TF+CAN@1D|{з1}|{open1}"
-        return _broadcast_signal(format_signal(sym, "1TF+CAN", z1, tag), key)
+        return _broadcast_signal(format_signal(sym, "1TF+CAN", з1, tag), key)
     return False
 
 def main():
