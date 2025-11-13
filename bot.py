@@ -60,9 +60,9 @@ STATE = load_state(STATE_PATH)
 
 def _chat_tokens() -> List[str]:
     """
-    Берём ЛЮБЫЕ числовые chat_id из TELEGRAM_CHAT (и -100..., и обычные).
+    Берём любые chat_id/идентификаторы из TELEGRAM_CHAT как есть.
     Пример:
-      TELEGRAM_CHAT="-1001234567890, 123456789"
+      TELEGRAM_CHAT="-1001234567890, 123456789, @mychannel"
     """
     if not TELEGRAM_CHAT:
         return []
@@ -71,8 +71,7 @@ def _chat_tokens() -> List[str]:
         x = x.strip()
         if not x:
             continue
-        if x.lstrip("-").isdigit():
-            out.append(x)
+        out.append(x)
     return out
 
 def tg_send_one(cid: str, text: str) -> bool:
@@ -598,7 +597,8 @@ def process_symbol(kind, name):
 
     d4 = demarker_series(k4,DEM_LEN)
     d1 = demarker_series(k1,DEM_LEN)
-    if not d4 or not d1:
+    # важное безопасное условие: проверяем именно на None
+    if d4 is None or d1 is None:
         return False
 
     v4 = last_closed(d4)
