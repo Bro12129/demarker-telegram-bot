@@ -1,4 +1,4 @@
-# bot.py — Bybit + TwelveData + MOEX ISS; crypto/FX/indices/stocks; normal 4H+1D; no Yahoo; 4-candle engulfing; gap-safe MOEX 4H
+# bot.py — Bybit + TwelveData + MOEX ISS; crypto/FX/indices/stocks; 4H+1D; no Yahoo; 4-candle engulfing; gap-safe + session 4H for MOEX
 
 import os, time, json, requests
 from datetime import datetime
@@ -6,20 +6,25 @@ from typing import List, Dict, Optional, Tuple, Set
 
 # ========== CONFIG / ENV ==========
 
-STATE_PATH     = os.getenv("STATE_PATH", "/data/state.json")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
-TG_API         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+STATE_PATH       = os.getenv("STATE_PATH", "/data/state.json")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_API           = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-DEM_LEN        = int(os.getenv("DEM_LEN", "28"))
-DEM_OB         = float(os.getenv("DEM_OB", "0.70"))
-DEM_OS         = float(os.getenv("DEM_OS", "0.30"))
-KLINE_4H       = os.getenv("KLINE_4H", "4h")
-KLINE_1D       = os.getenv("KLINE_1D", "1d")
-POLL_HRS       = int(os.getenv("POLL_HOURS", "1"))
-POLL_SECONDS   = POLL_HRS * 3600
+DEM_LEN          = int(os.getenv("DEM_LEN", "28"))
+DEM_OB           = float(os.getenv("DEM_OB", "0.70"))
+DEM_OS           = float(os.getenv("DEM_OS", "0.30"))
+KLINE_4H         = os.getenv("KLINE_4H", "4h")
+KLINE_1D         = os.getenv("KLINE_1D", "1d")
+POLL_HRS         = int(os.getenv("POLL_HOURS", "1"))
+POLL_SECONDS     = POLL_HRS * 3600
 
-TWELVE_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+TWELVE_API_KEY   = os.getenv("TWELVEDATA_API_KEY", "")
+
+# режим построения 4H по MOEX:
+# "gap"     — как раньше: только 4 подряд часа без дыр;
+# "session" — внутри дня берём свечи пачками по 4 от начала дня.
+MOEX_4H_MODE     = os.getenv("MOEX_4H_MODE", "gap").lower()
 
 # ========== STATE ==========
 
@@ -71,7 +76,6 @@ def tg_send_one(cid: str, text: str) -> bool:
         return r.status_code == 200
     except:
         return False
-
 
 def _broadcast_signal(text: str, signal_key: str) -> bool:
     chats = _chat_tokens()
@@ -141,7 +145,6 @@ def wick_ge_body_pct(ohlc, idx, pct=0.25):
     lower = min(o,c) - l
     return (upper >= pct*body) or (lower >= pct*body)
 
-
 def engulfing_with_prior4(ohlc):
     if not ohlc or len(ohlc) < 4:
         return False
@@ -160,7 +163,6 @@ def engulfing_with_prior4(ohlc):
     bull = bull2 and (not bull3) and (not bull4) and cover
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
-
 
 def candle_pattern(ohlc):
     return wick_ge_body_pct(ohlc, -2, 0.25) or engulfing_with_prior4(ohlc)
@@ -197,13 +199,14 @@ def refresh_bybit_instruments():
     except:
         pass
 
-
 def fetch_bybit_klines(symbol: str, interval: str, category: str, limit=600):
     iv = "240" if interval=="4h" else ("D" if interval.lower()=="1d" else interval)
     try:
-        r = requests.get(BB_KLINES,
+        r = requests.get(
+            BB_KLINES,
             params={"category":category,"symbol":symbol,"interval":iv,"limit":limit},
-            timeout=BB_TIMEOUT)
+            timeout=BB_TIMEOUT
+        )
         if r.status_code!=200:
             return None
         lst = (r.json().get("result") or {}).get("list") or []
@@ -228,7 +231,8 @@ def fetch_twelvedata_klines(symbol: str, interval: str, limit=500):
     td_iv = "4h" if iv=="4h" else "1day"
 
     try:
-        r = requests.get("https://api.twelvedata.com/time_series",
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
             params={
                 "symbol": symbol,
                 "interval": td_iv,
@@ -236,7 +240,8 @@ def fetch_twelvedata_klines(symbol: str, interval: str, limit=500):
                 "apikey": TWELVE_API_KEY,
                 "order": "asc"
             },
-            timeout=15)
+            timeout=15
+        )
         if r.status_code!=200:
             return None
         j=r.json()
@@ -266,17 +271,18 @@ def fetch_twelvedata_klines(symbol: str, interval: str, limit=500):
     except:
         return None
 
-# ========== MOEX (RUS, с защитой от пропусков для 4H) ==========
+# ========== MOEX (RUS, 4H gap-safe + session mode) ==========
 
 def fetch_moex_klines(sym: str, interval: str, limit=500):
     """
     sym: 'SBER.ME', 'IMOEX.ME' и т.п.
 
     interval:
-      - '1d' / '1day' / 'd' → берём дневные свечи (interval=24) и возвращаем как есть.
-      - '4h' / '240'       → берём часовые свечи (interval=60),
-                             собираем только полные 4-часовые бары
-                             ИЗ 4 ПОДРЯД ИДУЩИХ ЧАСОВ БЕЗ ВРЕМЕННЫХ ДЫР.
+      - '1d' / '1day' / 'd' → дневные свечи (interval=24).
+      - '4h' / '240'       → часовые свечи (interval=60),
+                             4H строится:
+                             * MOEX_4H_MODE = 'gap'     → только 4 подряд часа без дыр;
+                             * MOEX_4H_MODE = 'session' → внутри дня пачками по 4 от начала дня.
     """
 
     if not sym.endswith(".ME"):
@@ -291,7 +297,7 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
     iv = (interval or "").lower()
     want_4h = iv in ("4h","240")
     moex_iv = 60 if want_4h else 24
-    raw_limit = limit*8 if want_4h else limit   # небольшой запас по сырым данным
+    raw_limit = limit*8 if want_4h else limit   # запас по данным
 
     url = f"https://iss.moex.com/iss/engines/{engine}/markets/{market}/securities/{base}/candles.json"
 
@@ -331,38 +337,58 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
         if not want_4h:
             return raw[-limit:] if len(raw)>limit else raw
 
-        # 4H: защита от пропусков — только 4 подряд идущих часа
-        out=[]
-        buf=[]   # буфер для текущего 4-часового блока
-
-        for bar in raw:
-            ts, o,h,l,c_ = bar
-
-            if not buf:
-                # начинаем новый блок
+        # 4H режим "gap": только 4 подряд часа (без временных дыр)
+        if MOEX_4H_MODE == "gap":
+            out=[]
+            buf=[]
+            for bar in raw:
+                ts, o,h,l,c_ = bar
+                if not buf:
+                    buf.append(bar)
+                    continue
+                prev_ts = buf[-1][0]
+                if ts - prev_ts != 3600:
+                    buf = [bar]
+                    continue
                 buf.append(bar)
-                continue
+                if len(buf) == 4:
+                    ts4 = buf[0][0]
+                    o4  = buf[0][1]
+                    c4  = buf[-1][4]
+                    h4  = max(x[2] for x in buf)
+                    l4  = min(x[3] for x in buf)
+                    out.append([ts4,o4,h4,l4,c4])
+                    buf = []
+            if not out:
+                return None
+            return out[-limit:] if len(out)>limit else out
 
-            prev_ts = buf[-1][0]
-            # если разрыв по времени ≠ 3600 секунд — сбрасываем буфер
-            if ts - prev_ts != 3600:
-                buf = [bar]
-                continue
+        # 4H режим "session": внутри дня пачками по 4 бара от начала дня
+        out=[]
+        # группируем по дате (по локальной дате в datetime, без tz)
+        day_bars: Dict[str, List[List[float]]] = {}
+        for bar in raw:
+            ts = bar[0]
+            dstr = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            day_bars.setdefault(dstr, []).append(bar)
 
-            buf.append(bar)
-
-            if len(buf) == 4:
-                ts4 = buf[0][0]
-                o4  = buf[0][1]
-                c4  = buf[-1][4]
-                h4  = max(x[2] for x in buf)
-                l4  = min(x[3] for x in buf)
+        for dstr in sorted(day_bars.keys()):
+            bars = day_bars[dstr]
+            bars.sort(key=lambda x:x[0])
+            # формируем блоки [0:4], [4:8], ...
+            n = len(bars) // 4
+            for i in range(n):
+                chunk = bars[i*4:(i+1)*4]
+                ts4 = chunk[0][0]
+                o4  = chunk[0][1]
+                c4  = chunk[-1][4]
+                h4  = max(x[2] for x in chunk)
+                l4  = min(x[3] for x in chunk)
                 out.append([ts4,o4,h4,l4,c4])
-                buf = []
 
         if not out:
             return None
-
+        out.sort(key=lambda x:x[0])
         return out[-limit:] if len(out)>limit else out
 
     except:
@@ -370,8 +396,10 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
 
 # ========== UNIVERSE ==========
 
-CRYPTO = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX",
-          "DOT","LINK","LTC","MATIC","TON","ATOM","NEAR"]
+CRYPTO = [
+    "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX",
+    "DOT","LINK","LTC","MATIC","TON","ATOM","NEAR"
+]
 
 ALIAS = {
     "ES":"US500USDT","^GSPC":"US500USDT",
@@ -400,9 +428,11 @@ MOEX_LIST = [
     "PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
 ]
 
-FX_ISO = {"USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD",
-          "MXN","CNY","HKD","SGD","SEK","NOK","DKK","ZAR","TRY","PLN",
-          "CZK","HUF","ILS","KRW","TWD","THB","INR","BRL","RUB","AED","SAR"}
+FX_ISO = {
+    "USD","EUR","JPY","GBP","AUD","NZD","CHF","CAD",
+    "MXN","CNY","HKD","SGD","SEK","NOK","DKK","ZAR","TRY","PLN",
+    "CZK","HUF","ILS","KRW","TWD","THB","INR","BRL","RUB","AED","SAR"
+}
 
 def is_fx(sym: str):
     s="".join(ch for ch in sym.upper() if ch.isalpha())
@@ -458,7 +488,6 @@ def fetch_crypto(base: str, interval: str):
     td = f"{base}/USD"
     return fetch_twelvedata_klines(td,interval), td,"TD"
 
-
 def fetch_other(sym: str, interval: str):
     alias = bybit_alias(sym)
     if alias:
@@ -483,7 +512,8 @@ def fetch_other(sym: str, interval: str):
 
 def build_plan():
     plan=[]
-    for b in CRYPTO: plan.append(("CRYPTO",b))
+    for b in CRYPTO:
+        plan.append(("CRYPTO",b))
     for k in sorted(set(list(ALIAS.keys()) + list(TOKEN_STOCKS))):
         plan.append(("OTHER",k))
     for m in MOEX_LIST:
@@ -515,7 +545,7 @@ def process_symbol(kind, name):
 
     open4 = k4[-2][0]
     open1 = k1[-2][0]
-    dual = max(open4,open1)
+    dual  = max(open4,open1)
 
     sym = n4 or n1 or name
     if sym.endswith(".ME"):
@@ -525,18 +555,15 @@ def process_symbol(kind, name):
     else:
         src = "TD"
 
-    # dual
     if z4 and z1 and z4==z1:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}"
         return _broadcast_signal(format_signal(sym,sig,z4,src), key)
 
-    # 4h only
     if z4 and not z1 and candle_pattern(k4):
         key = f"{sym}|1TF+CAN@4H|{z4}|{open4}"
         return _broadcast_signal(format_signal(sym,"1TF+CAN",z4,src), key)
 
-    # 1d only
     if z1 and not z4 and candle_pattern(k1):
         key = f"{sym}|1TF+CAN@1D|{z1}|{open1}"
         return _broadcast_signal(format_signal(sym,"1TF+CAN",z1,src), key)
