@@ -59,12 +59,19 @@ STATE = load_state(STATE_PATH)
 # ========== TELEGRAM ==========
 
 def _chat_tokens() -> List[str]:
+    """
+    Берём ЛЮБЫЕ числовые chat_id из TELEGRAM_CHAT (и -100..., и обычные).
+    Пример:
+      TELEGRAM_CHAT="-1001234567890, 123456789"
+    """
     if not TELEGRAM_CHAT:
         return []
-    out = []
+    out: List[str] = []
     for x in TELEGRAM_CHAT.split(","):
         x = x.strip()
-        if x.startswith("-100"):
+        if not x:
+            continue
+        if x.lstrip("-").isdigit():
             out.append(x)
     return out
 
@@ -212,6 +219,9 @@ _BB_LINEAR: Set[str] = set()
 _BB_SPOT:   Set[str] = set()
 
 def refresh_bybit_instruments():
+    """
+    Сейчас список инструментов только подстраховка/лог, но логика fetch_* от него НЕ зависит.
+    """
     global _BB_LINEAR, _BB_SPOT
     _BB_LINEAR=set(); _BB_SPOT=set()
 
@@ -500,40 +510,60 @@ def bybit_alias(sym: str):
 # ========== FETCH ROUTERS ==========
 
 def fetch_crypto(base: str, interval: str):
-    bb_lin = base+"USDT"
-    bb_perp = base+"PERP"
+    """
+    КРИПТА:
+    1) Сначала пытаемся взять с Bybit:
+       - BASEUSDT linear
+       - BASEPERP linear
+       - BASEUSDT spot
+    2) Если Bybit ничего не дал → пробуем TwelveData BASE/USD.
+    НИКАКИХ проверок вида 'in _BB_LINEAR' — чтобы бот не молчал, если instruments-info не отдал список.
+    """
+    bb_lin  = base + "USDT"
+    bb_perp = base + "PERP"
 
-    if bb_lin in _BB_LINEAR:
-        d=fetch_bybit_klines(bb_lin, interval,"linear")
-        if d: return d,bb_lin,"BB"
+    # Bybit linear USDT
+    d = fetch_bybit_klines(bb_lin, interval, "linear")
+    if d:
+        return d, bb_lin, "BB"
 
-    if bb_perp in _BB_LINEAR:
-        d=fetch_bybit_klines(bb_perp, interval,"linear")
-        if d: return d,bb_perp,"BB"
+    # Bybit linear PERP
+    d = fetch_bybit_klines(bb_perp, interval, "linear")
+    if d:
+        return d, bb_perp, "BB"
 
-    if bb_lin in _BB_SPOT:
-        d=fetch_bybit_klines(bb_lin,interval,"spot")
-        if d: return d,bb_lin,"BB"
+    # Bybit spot USDT
+    d = fetch_bybit_klines(bb_lin, interval, "spot")
+    if d:
+        return d, bb_lin, "BB"
 
+    # Fallback: TwelveData
     td = f"{base}/USD"
-    return fetch_twelvedata_klines(td,interval), td,"TD"
+    return fetch_twelvedata_klines(td, interval), td, "TD"
 
 def fetch_other(sym: str, interval: str):
+    """
+    Индексы, металлы, FX, токенизированные акции, MOEX:
+    1) Если есть alias → сразу пробуем Bybit linear.
+    2) Если .ME → MOEX ISS.
+    3) Если FX → TwelveData base/quote.
+    4) Иначе → TwelveData по оригинальному симу.
+    """
     alias = bybit_alias(sym)
     if alias:
-        if alias in _BB_LINEAR:
-            d=fetch_bybit_klines(alias,interval,"linear")
-            if d: return d,alias,"BB"
+        d = fetch_bybit_klines(alias, interval, "linear")
+        if d:
+            return d, alias, "BB"
 
     if sym.endswith(".ME"):
-        d=fetch_moex_klines(sym,interval)
-        return d,sym,"MOEX"
+        d = fetch_moex_klines(sym, interval)
+        return d, sym, "MOEX"
 
     if is_fx(sym):
         td = fx_to_td(sym)
-        return fetch_twelvedata_klines(td,interval), td,"TD"
+        return fetch_twelvedata_klines(td, interval), td, "TD"
 
-    return fetch_twelvedata_klines(sym,interval), sym,"TD"
+    return fetch_twelvedata_klines(sym, interval), sym, "TD"
 
 # ========== PLAN ==========
 
