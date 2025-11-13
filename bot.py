@@ -1,4 +1,5 @@
 # bot.py — Bybit + TwelveData + MOEX ISS; crypto/FX/indices/stocks; 4H+1D; no Yahoo; 4-candle engulfing; gap-safe + session 4H for MOEX
+# ВСЕГДА и ВЕЗДЕ работает ТОЛЬКО по ЗАКРЫТЫМ свечам.
 
 import os, time, json, requests
 from datetime import datetime
@@ -22,7 +23,7 @@ POLL_SECONDS     = POLL_HRS * 3600
 TWELVE_API_KEY   = os.getenv("TWELVEDATA_API_KEY", "")
 
 # режим построения 4H по MOEX:
-# "gap"     — как раньше: только 4 подряд часа без дыр;
+# "gap"     — только 4 подряд часа без дыр;
 # "session" — внутри дня берём свечи пачками по 4 от начала дня.
 MOEX_4H_MODE     = os.getenv("MOEX_4H_MODE", "gap").lower()
 
@@ -94,10 +95,22 @@ def _broadcast_signal(text: str, signal_key: str) -> bool:
 
     return sent_any
 
+# ========== HELPERS: ТОЛЬКО ЗАКРЫТЫЕ СВЕЧИ ==========
+
+def closed_ohlc(ohlc: Optional[List[List[float]]]) -> List[List[float]]:
+    """
+    Возвращает только закрытые свечи:
+    - если данных < 2, считаем, что нормальной истории нет;
+    - всегда отрезаем последний бар (потенциально незакрытый).
+    """
+    if not ohlc or len(ohlc) < 2:
+        return []
+    return ohlc[:-1]
+
 # ========== INDICATORS ==========
 
 def demarker_series(ohlc: List[List[float]], length: int):
-    if not ohlc or len(ohlc) < length + 2:
+    if not ohlc or len(ohlc) < length + 1:
         return None
     highs = [x[2] for x in ohlc]
     lows  = [x[3] for x in ohlc]
@@ -118,9 +131,13 @@ def demarker_series(ohlc: List[List[float]], length: int):
     return dem
 
 def last_closed(series):
-    if not series or len(series) < 2:
+    """
+    Берём последнюю НЕ-None точку индикатора.
+    Серия соответствует ТОЛЬКО закрытым свечам.
+    """
+    if not series:
         return None
-    i = len(series) - 2
+    i = len(series) - 1
     while i >= 0 and series[i] is None:
         i -= 1
     return series[i] if i >= 0 else None
@@ -137,6 +154,8 @@ def zone_of(v):
 def wick_ge_body_pct(ohlc, idx, pct=0.25):
     if not ohlc:
         return False
+    if not (-len(ohlc) <= idx < len(ohlc)):
+        return False
     o,h,l,c = ohlc[idx][1:5]
     body = abs(c - o)
     if body <= 1e-12:
@@ -145,27 +164,42 @@ def wick_ge_body_pct(ohlc, idx, pct=0.25):
     lower = min(o,c) - l
     return (upper >= pct*body) or (lower >= pct*body)
 
-def engulfing_with_prior4(ohlc):
-    if not ohlc or len(ohlc) < 4:
+def engulfing_with_prior4(ohlc: List[List[float]]) -> bool:
+    """
+    Строго по ЗАКРЫТЫМ свечам.
+    Используем 3 последние закрытые:
+    -1: поглощающая
+    -2: поглощённая, противоположного цвета
+    -3: того же цвета, что -2 (фон тренда)
+    """
+    if not ohlc or len(ohlc) < 3:
         return False
     try:
-        o2,h2,l2,c2 = ohlc[-2][1:5]
-        o3,h3,l3,c3 = ohlc[-3][1:5]
-        o4,h4,l4,c4 = ohlc[-4][1:5]
+        o2,h2,l2,c2 = ohlc[-1][1:5]  # поглощающая
+        o3,h3,l3,c3 = ohlc[-2][1:5]  # поглощённая
+        o4,h4,l4,c4 = ohlc[-3][1:5]  # фон
     except:
         return False
 
     bull2 = c2 >= o2
     bull3 = c3 >= o3
     bull4 = c4 >= o4
+
     cover = (min(o2,c2) <= min(o3,c3)) and (max(o2,c2) >= max(o3,c3))
 
     bull = bull2 and (not bull3) and (not bull4) and cover
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
 
-def candle_pattern(ohlc):
-    return wick_ge_body_pct(ohlc, -2, 0.25) or engulfing_with_prior4(ohlc)
+def candle_pattern(ohlc: List[List[float]]) -> bool:
+    """
+    Свечной паттерн ищем ТОЛЬКО по закрытым свечам.
+    Используем последние закрытые бары.
+    """
+    o = closed_ohlc(ohlc)
+    if len(o) < 3:
+        return False
+    return wick_ge_body_pct(o, -1, 0.25) or engulfing_with_prior4(o)
 
 # ========== BYBIT ==========
 
@@ -314,7 +348,6 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
         if any(x not in idx for x in need):
             return None
 
-        # сырые бары (1h или 1d)
         raw=[]
         for row in data:
             try:
@@ -333,7 +366,6 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
         if not raw:
             return None
 
-        # дневки — без агрегации
         if not want_4h:
             return raw[-limit:] if len(raw)>limit else raw
 
@@ -365,7 +397,6 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
 
         # 4H режим "session": внутри дня пачками по 4 бара от начала дня
         out=[]
-        # группируем по дате (по локальной дате в datetime, без tz)
         day_bars: Dict[str, List[List[float]]] = {}
         for bar in raw:
             ts = bar[0]
@@ -375,7 +406,6 @@ def fetch_moex_klines(sym: str, interval: str, limit=500):
         for dstr in sorted(day_bars.keys()):
             bars = day_bars[dstr]
             bars.sort(key=lambda x:x[0])
-            # формируем блоки [0:4], [4:8], ...
             n = len(bars) // 4
             for i in range(n):
                 chunk = bars[i*4:(i+1)*4]
@@ -495,17 +525,14 @@ def fetch_other(sym: str, interval: str):
             d=fetch_bybit_klines(alias,interval,"linear")
             if d: return d,alias,"BB"
 
-    # MOEX
     if sym.endswith(".ME"):
         d=fetch_moex_klines(sym,interval)
         return d,sym,"MOEX"
 
-    # FX
     if is_fx(sym):
         td = fx_to_td(sym)
         return fetch_twelvedata_klines(td,interval), td,"TD"
 
-    # Остальное — TwelveData
     return fetch_twelvedata_klines(sym,interval), sym,"TD"
 
 # ========== PLAN ==========
@@ -524,12 +551,18 @@ def build_plan():
 
 def process_symbol(kind, name):
     if kind=="CRYPTO":
-        k4, n4, s4 = fetch_crypto(name,KLINE_4H)
-        k1, n1, s1 = fetch_crypto(name,KLINE_1D)
+        k4_raw, n4, s4 = fetch_crypto(name,KLINE_4H)
+        k1_raw, n1, s1 = fetch_crypto(name,KLINE_1D)
     else:
-        k4, n4, s4 = fetch_other(name,KLINE_4H)
-        k1, n1, s1 = fetch_other(name,KLINE_1D)
+        k4_raw, n4, s4 = fetch_other(name,KLINE_4H)
+        k1_raw, n1, s1 = fetch_other(name,KLINE_1D)
 
+    if not k4_raw or not k1_raw:
+        return False
+
+    # работаем ТОЛЬКО по закрытым свечам
+    k4 = closed_ohlc(k4_raw)
+    k1 = closed_ohlc(k1_raw)
     if not k4 or not k1:
         return False
 
@@ -543,8 +576,9 @@ def process_symbol(kind, name):
     z4 = zone_of(v4)
     z1 = zone_of(v1)
 
-    open4 = k4[-2][0]
-    open1 = k1[-2][0]
+    # времена последних ЗАКРЫТЫХ баров
+    open4 = k4[-1][0]
+    open1 = k1[-1][0]
     dual  = max(open4,open1)
 
     sym = n4 or n1 or name
