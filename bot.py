@@ -1,5 +1,5 @@
-# bot.py — FINAL — Bybit + TwelveData; МОEX временно отключен
-# 4H + 1D, только закрытые свечи, wick≥25%, engulfing, L/L+CAN/1TF+CAN
+# bot.py — Bybit + TwelveData (crypto/FX/indices/stocks/RU .ME); 4H+1D
+# Только закрытые свечи, DeMarker(28), wick>=25%, engulfing, сигналы LIGHT / L+CAN / 1TF+CAN
 
 import os, time, json, requests
 from datetime import datetime
@@ -21,7 +21,6 @@ POLL_HRS         = float(os.getenv("POLL_HOURS", "1"))
 POLL_SECONDS     = int(POLL_HRS * 3600)
 
 TWELVE_API_KEY   = os.getenv("TWELVEDATA_API_KEY", "")
-MOEX_4H_MODE     = os.getenv("MOEX_4H_MODE", "gap").lower()
 
 # ================= STATE =====================
 
@@ -286,11 +285,16 @@ STOCKS = [
     "AVGO","NFLX","AMD","JPM","V","MA","UNH","LLY","XOM","KO","PEP"
 ]
 
+# Российские акции/индексы — через TwelveData, тикеры .ME
+RU_STOCKS = [
+    "IMOEX.ME","RTSI.ME","GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME",
+    "ALRS.ME","GMKN.ME","YNDX.ME","MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME",
+    "PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
+]
+
 FX = [
     "EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"
 ]
-
-# МОEX выключен: МОEX_LIST убрал из плана, чтобы не было ложных RTSI.ME и т.п.
 
 # ================= FETCH ROUTERS =====================
 
@@ -316,15 +320,18 @@ def fetch_crypto(base, interval):
     return fetch_twelvedata_klines(td, interval), td, "TD"
 
 def fetch_other(sym, interval):
+    # Bybit USDT-перпы/CFD
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
 
+    # FX по ISO
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         td = fx_to_td(sym)
         return fetch_twelvedata_klines(td, interval), td, "TD"
 
+    # Всё остальное (включая .ME) — напрямую в TwelveData
     return fetch_twelvedata_klines(sym, interval), sym, "TD"
 
 # ================= PLAN =====================
@@ -337,7 +344,7 @@ def build_plan():
     for x in ENERGY:     plan.append(("OTHER", x))
     for x in STOCKS:     plan.append(("OTHER", x))
     for x in FX:         plan.append(("OTHER", x))
-    # МОEX_LIST НЕ добавляем, чтобы не слать ложные сигналы
+    for x in RU_STOCKS:  plan.append(("OTHER", x))
     return plan
 
 # ================= CORE =====================
@@ -350,6 +357,7 @@ def process_symbol(kind, name):
         k4_raw, n4, s4 = fetch_other(name, KLINE_4H)
         k1_raw, n1, s1 = fetch_other(name, KLINE_1D)
 
+    # Оба ТФ должны быть, иначе сигнала нет
     if not k4_raw or not k1_raw:
         return False
 
