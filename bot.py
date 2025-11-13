@@ -1,4 +1,4 @@
-# bot.py — FINAL — Bybit + TwelveData + MOEX ISS
+# bot.py — FINAL — Bybit + TwelveData; МОEX временно отключен
 # 4H + 1D, только закрытые свечи, wick≥25%, engulfing, L/L+CAN/1TF+CAN
 
 import os, time, json, requests
@@ -166,6 +166,27 @@ def candle_pattern(ohlc):
         return False
     return wick_ge_body_pct(o, -1, 0.25) or engulfing_with_prior4(o)
 
+# ================= FORMAT TICKER =====================
+
+def is_fx_sym(sym: str) -> bool:
+    s = "".join(ch for ch in sym.upper() if ch.isalpha())
+    return len(s) >= 6
+
+def to_display(sym: str) -> str:
+    s = sym.upper()
+    if s.endswith(".ME"):
+        return s
+    if s.endswith("USDT"):
+        return s[:-4] + "-USDT"
+    if is_fx_sym(s) and len(s) == 6:
+        return s + "-USD"
+    return s
+
+def format_signal(symbol: str, sig: str, zone: str, src: str) -> str:
+    arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
+    status = "⚡" if sig == "LIGHT" else ("⚡🕯️" if sig == "L+CAN" else "🕯️")
+    return f"{to_display(symbol)} [{src}] {arrow}{status}"
+
 # ================= BYBIT =====================
 
 BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
@@ -239,79 +260,6 @@ def fetch_twelvedata_klines(symbol, interval, limit=500):
     except:
         return None
 
-# ================= MOEX =====================
-
-def fetch_moex_klines(sym, interval, limit=500):
-    if not sym.endswith(".ME"):
-        return None
-    base = sym[:-3]
-
-    if base in ("IMOEX", "RTSI"):
-        engine = "stock"; market = "index"
-    else:
-        engine = "stock"; market = "shares"
-
-    want_4h = interval == "4h"
-    moex_iv = 60 if want_4h else 24
-    raw_limit = limit*8 if want_4h else limit
-
-    url = f"https://iss.moex.com/iss/engines/{engine}/markets/{market}/securities/{base}/candles.json"
-
-    try:
-        r = requests.get(url, params={"interval": moex_iv, "limit": raw_limit}, timeout=15)
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        c = j.get("candles") or {}
-        cols = c.get("columns") or []
-        data = c.get("data") or []
-        idx = {n: i for i, n in enumerate(cols)}
-        need = ["begin", "open", "high", "low", "close"]
-        if any(x not in idx for x in need):
-            return None
-
-        raw = []
-        for row in data:
-            try:
-                ts = int(datetime.strptime(row[idx["begin"]], "%Y-%m-%d %H:%M:%S").timestamp())
-                o = float(row[idx["open"]]); h = float(row[idx["high"]])
-                l = float(row[idx["low"]]);  c_ = float(row[idx["close"]])
-                if h <= 0 or l <= 0:
-                    continue
-                raw.append([ts, o, h, l, c_])
-            except:
-                pass
-        raw.sort(key=lambda x: x[0])
-        if not raw:
-            return None
-
-        if not want_4h:
-            return raw[-limit:] if len(raw) > limit else raw
-
-        out = []
-        buf = []
-        for bar in raw:
-            ts = bar[0]
-            if not buf:
-                buf = [bar]
-                continue
-            if ts - buf[-1][0] != 3600:
-                buf = [bar]
-                continue
-            buf.append(bar)
-            if len(buf) == 4:
-                o4 = buf[0][1]; c4 = buf[-1][4]
-                h4 = max(x[2] for x in buf)
-                l4 = min(x[3] for x in buf)
-                out.append([buf[0][0], o4, h4, l4, c4])
-                buf = []
-        if not out:
-            return None
-        return out[-limit:] if len(out) > limit else out
-
-    except:
-        return None
-
 # ================= TICKERS =====================
 
 CRYPTO = [
@@ -338,15 +286,11 @@ STOCKS = [
     "AVGO","NFLX","AMD","JPM","V","MA","UNH","LLY","XOM","KO","PEP"
 ]
 
-MOEX_LIST = [
-    "IMOEX.ME","RTSI.ME","GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME",
-    "ALRS.ME","GMKN.ME","YNDX.ME","MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME",
-    "PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
-]
-
 FX = [
     "EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"
 ]
+
+# МОEX выключен: МОEX_LIST убрал из плана, чтобы не было ложных RTSI.ME и т.п.
 
 # ================= FETCH ROUTERS =====================
 
@@ -377,10 +321,6 @@ def fetch_other(sym, interval):
         if d:
             return d, sym, "BB"
 
-    if sym.endswith(".ME"):
-        d = fetch_moex_klines(sym, interval)
-        return d, sym, "MOEX"
-
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         td = fx_to_td(sym)
         return fetch_twelvedata_klines(td, interval), td, "TD"
@@ -397,7 +337,7 @@ def build_plan():
     for x in ENERGY:     plan.append(("OTHER", x))
     for x in STOCKS:     plan.append(("OTHER", x))
     for x in FX:         plan.append(("OTHER", x))
-    for x in MOEX_LIST:  plan.append(("OTHER", x))
+    # МОEX_LIST НЕ добавляем, чтобы не слать ложные сигналы
     return plan
 
 # ================= CORE =====================
@@ -410,7 +350,6 @@ def process_symbol(kind, name):
         k4_raw, n4, s4 = fetch_other(name, KLINE_4H)
         k1_raw, n1, s1 = fetch_other(name, KLINE_1D)
 
-    # Больше НЕТ safe_choose: если одного ТФ нет — сигнала быть не должно
     if not k4_raw or not k1_raw:
         return False
 
@@ -434,24 +373,22 @@ def process_symbol(kind, name):
     dual  = max(open4, open1)
 
     sym = n4 or n1 or name
-    src = "MOEX" if sym.endswith(".ME") else ("BB" if "BB" in (s4, s1) else "TD")
-
-    # В ТГ уходит только ТИКЕР (sym), без стрелок и текста
+    src = "BB" if "BB" in (s4, s1) else "TD"
 
     if z4 and z1 and z4 == z1:
         sig = "L+CAN" if (candle_pattern(k4) or candle_pattern(k1)) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
-        return _broadcast_signal(sym, key)
+        return _broadcast_signal(format_signal(sym, sig, z4, src), key)
 
     if z4 and not z1 and candle_pattern(k4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
-        return _broadcast_signal(sym, key)
+        return _broadcast_signal(format_signal(sym, sig, z4, src), key)
 
     if z1 and not z4 and candle_pattern(k1):
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
-        return _broadcast_signal(sym, key)
+        return _broadcast_signal(format_signal(sym, sig, z1, src), key)
 
     return False
 
