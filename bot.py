@@ -1,4 +1,4 @@
-# bot.py — Bybit + ALT (Finnhub как абстрактный резерв)
+# bot.py — Bybit + ALT (резерв), с DEBUG
 # Closed candles only, DeMarker(28), wick>=25%, engulfing
 # Signals:
 #   ⚡ / ⚡🕯️  — 4H & 1D same zone
@@ -31,6 +31,8 @@ ALT_API_KEY      = os.getenv("FINNHUB_API_KEY", "")   # абстрактный �
 ALT_BASE         = "https://finnhub.io/api/v1"
 ALT_TIMEOUT      = 15
 
+DEBUG_INTERVAL   = 6 * 3600  # 6 часов
+
 # ================= STATE =====================
 
 def load_state(path: str) -> Dict:
@@ -38,7 +40,7 @@ def load_state(path: str) -> Dict:
         with open(path, "r") as f:
             return json.load(f)
     except:
-        return {"sent": {}}
+        return {"sent": {}, "last_debug": 0}
 
 def save_state(path: str, data: Dict):
     try:
@@ -57,6 +59,8 @@ def gc_state(state: Dict, days=21):
         if isinstance(v,int) and v < cutoff:
             del sent[k]
     state["sent"] = sent
+    if "last_debug" not in state:
+        state["last_debug"] = 0
 
 STATE = load_state(STATE_PATH)
 
@@ -304,7 +308,6 @@ def fetch_other(sym,interval):
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym,interval,"linear")
         if d: return d,sym,"BB"
-        # здесь можно добавить spot при желании
         return None,sym,"BB"
 
     # FX — только ALT
@@ -330,6 +333,51 @@ def build_plan():
     for x in FX:         plan.append(("OTHER",x))
     for x in RU_STOCKS:  plan.append(("OTHER",x))
     return plan
+
+# ================= DEBUG =====================
+
+def debug_btc():
+    """DEBUG по BTC: зоны 4H/1D + паттерны."""
+    try:
+        k4_raw, n4, s4 = fetch_crypto("BTC", KLINE_4H)
+        k1_raw, n1, s1 = fetch_crypto("BTC", KLINE_1D)
+
+        have4 = bool(k4_raw)
+        have1 = bool(k1_raw)
+        if not have4 and not have1:
+            _broadcast_signal("DEBUG BTC no data", f"DEBUG|BTC|{int(time.time())}")
+            return
+
+        k4 = closed_ohlc(k4_raw) if have4 else None
+        k1 = closed_ohlc(k1_raw) if have1 else None
+        if have4 and not k4: have4=False
+        if have1 and not k1: have1=False
+        if not have4 and not have1:
+            _broadcast_signal("DEBUG BTC no closed bars", f"DEBUG|BTC|{int(time.time())}")
+            return
+
+        d4 = demarker_series(k4, DEM_LEN) if have4 else None
+        d1 = demarker_series(k1, DEM_LEN) if have1 else None
+        v4 = last_closed(d4) if d4 else None
+        v1 = last_closed(d1) if d1 else None
+
+        z4 = zone_of(v4)
+        z1 = zone_of(v1)
+
+        pat4 = candle_pattern(k4) if have4 else False
+        pat1 = candle_pattern(k1) if have1 else False
+
+        sym = n4 or n1 or "BTC"
+        src = "BB" if "BB" in (s4,s1) else "ALT"
+
+        msg = (
+            f"DEBUG {to_display(sym)} [{src}] "
+            f"4H={z4 or 'NONE'} 1D={z1 or 'NONE'} "
+            f"pat4={int(bool(pat4))} pat1={int(bool(pat1))}"
+        )
+        _broadcast_signal(msg, f"DEBUG|BTC|{int(time.time())}")
+    except:
+        pass
 
 # ================= CORE =====================
 
@@ -401,9 +449,12 @@ def main():
         print(f"Loaded {len(plan_preview)} symbols for scan.", flush=True)
         print(f"First symbol checked: {plan_preview[0][1]}", flush=True)
 
-    # стартовый пинг: если его нет в группе — проблема в TOKEN/CHAT_ID
+    # стартовый пинг + моментальный DEBUG
     try:
         _broadcast_signal("START", f"START|{int(time.time())}")
+        debug_btc()  # сразу при старте
+        STATE["last_debug"] = int(time.time())
+        save_state(STATE_PATH, STATE)
     except:
         pass
 
@@ -412,7 +463,16 @@ def main():
         for kind,name in plan:
             process_symbol(kind,name)
             time.sleep(1)
+
+        # GC + плановое сохранение
         gc_state(STATE,21)
+
+        # периодический DEBUG раз в 6 часов
+        now = int(time.time())
+        if now - int(STATE.get("last_debug", 0)) >= DEBUG_INTERVAL:
+            debug_btc()
+            STATE["last_debug"] = now
+
         save_state(STATE_PATH,STATE)
         time.sleep(POLL_SECONDS)
 
