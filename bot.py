@@ -21,8 +21,8 @@ DEM_OB           = float(os.getenv("DEM_OB", "0.70"))
 DEM_OS           = float(os.getenv("DEM_OS", "0.30"))
 KLINE_4H         = os.getenv("KLINE_4H", "4h")
 KLINE_1D         = os.getenv("KLINE_1D", "1d")
-POLL_HRS         = float(os.getenv("POLL_HOURS", "1"))
-POLL_SECONDS     = int(POLL_HRS * 3600)
+# Polling interval: 60 seconds between full scans
+POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "60"))
 
 FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "")
 
@@ -219,7 +219,7 @@ def format_signal(symbol: str, sig: str, zone: str, src: str) -> str:
 # ================= BYBIT =====================
 
 BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
-BB_KLINES  = f"{BYBIT_BASE}/v5/market/kline"
+BB_KLINES  = f"{BYBIT_BASE}/v5/market/kline"}
 BB_TIMEOUT = 15
 
 def fetch_bybit_klines(symbol: str, interval: str, category: str, limit=600):
