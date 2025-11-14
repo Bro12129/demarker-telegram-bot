@@ -1,4 +1,4 @@
-# bot.py — Bybit + TwelveData (crypto/FX/indices/stocks/RU .ME); 4H+1D
+# bot.py — Bybit + Finnhub (crypto/FX/indices/stocks/RU .ME); 4H+1D
 # Только закрытые свечи, DeMarker(28), wick>=25%, engulfing
 # Сигналы:
 #   ⚡ / ⚡🕯️  — совпадение 4H и 1D
@@ -24,7 +24,7 @@ KLINE_1D         = os.getenv("KLINE_1D", "1d")
 POLL_HRS         = float(os.getenv("POLL_HOURS", "1"))
 POLL_SECONDS     = int(POLL_HRS * 3600)
 
-TWELVE_API_KEY   = os.getenv("TWELVEDATA_API_KEY", "")
+FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "")
 
 # ================= STATE =====================
 
@@ -221,46 +221,70 @@ def fetch_bybit_klines(symbol: str, interval: str, category: str, limit=600):
     except:
         return None
 
-# ================= TWELVEDATA =====================
+# ================= FINNHUB =====================
 
-def fetch_twelvedata_klines(symbol: str, interval: str, limit=500):
-    if not TWELVE_API_KEY:
+FINNHUB_BASE   = os.getenv("FINNHUB_BASE", "https://finnhub.io/api/v1")
+FH_TIMEOUT     = 15
+
+def fx_to_fh(sym: str) -> str:
+    s = sym.upper()
+    if len(s) == 6 and s[:3].isalpha() and s[3:].isalpha():
+        return f"OANDA:{s[:3]}_{s[3:]}"
+    return s
+
+def crypto_base_to_fh(base: str) -> str:
+    return f"BINANCE:{base.upper()}USDT"
+
+def fetch_finnhub_candles(kind: str, symbol: str, interval: str):
+    if not FINNHUB_API_KEY:
         return None
-    td_iv = "4h" if interval == "4h" else "1day"
+    if interval == "4h":
+        res = "240"
+        span_days = 200
+    else:
+        res = "D"
+        span_days = 800
+    to_ts = int(time.time())
+    from_ts = to_ts - span_days * 86400
+
+    if kind == "CRYPTO":
+        path = "/crypto/candle"
+    elif kind == "FX":
+        path = "/forex/candle"
+    else:
+        path = "/stock/candle"
+
     try:
         r = requests.get(
-            "https://api.twelvedata.com/time_series",
+            FINNHUB_BASE + path,
             params={
                 "symbol": symbol,
-                "interval": td_iv,
-                "outputsize": str(limit),
-                "apikey": TWELVE_API_KEY,
-                "order": "asc"
+                "resolution": res,
+                "from": from_ts,
+                "to": to_ts,
+                "token": FINNHUB_API_KEY
             },
-            timeout=15
+            timeout=FH_TIMEOUT
         )
         if r.status_code != 200:
             return None
         j = r.json()
-        if j.get("status") != "ok":
+        if j.get("s") != "ok":
             return None
+        t = j.get("t") or []
+        o = j.get("o") or []
+        h = j.get("h") or []
+        l = j.get("l") or []
+        c = j.get("c") or []
         out = []
-        for row in j.get("values") or []:
-            dt = row["datetime"]
-            ts = None
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                try:
-                    ts = int(datetime.strptime(dt, fmt).timestamp())
-                    break
-                except:
-                    pass
-            if ts is None:
+        n = min(len(t), len(o), len(h), len(l), len(c))
+        for i in range(n):
+            ts = int(t[i])
+            oo = float(o[i]); hh = float(h[i]); ll = float(l[i]); cc = float(c[i])
+            if hh <= 0 or ll <= 0:
                 continue
-            o = float(row["open"]); h = float(row["high"])
-            l = float(row["low"]);  c = float(row["close"])
-            if h <= 0 or l <= 0:
-                continue
-            out.append([ts, o, h, l, c])
+            out.append([ts, oo, hh, ll, cc])
+        out.sort(key=lambda x: x[0])
         return out
     except:
         return None
@@ -303,38 +327,48 @@ FX = [
 
 # ================= FETCH ROUTERS =====================
 
-def fx_to_td(sym: str) -> str:
-    return sym[:3] + "/" + sym[3:]
-
 def fetch_crypto(base: str, interval: str):
+    # 1) Bybit linear USDT
     bb_lin = base + "USDT"
     d = fetch_bybit_klines(bb_lin, interval, "linear")
     if d:
         return d, bb_lin, "BB"
 
+    # 2) Bybit PERP
     bb_perp = base + "PERP"
     d = fetch_bybit_klines(bb_perp, interval, "linear")
     if d:
         return d, bb_perp, "BB"
 
+    # 3) Bybit spot
     d = fetch_bybit_klines(bb_lin, interval, "spot")
     if d:
         return d, bb_lin, "BB"
 
-    td = base + "/USD"
-    return fetch_twelvedata_klines(td, interval), td, "TD"
+    # 4) Finnhub crypto (BINANCE)
+    fh_sym = crypto_base_to_fh(base)
+    d = fetch_finnhub_candles("CRYPTO", fh_sym, interval)
+    return d, fh_sym, "FH"
 
 def fetch_other(sym: str, interval: str):
+    # 1) Все, что на Bybit как USDT-перпы/CFD: сначала пробуем Bybit
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
+        # если Bybit ничего не дал — альтернативы здесь не навязываем
+        return None, sym, "BB"
 
+    # 2) FX через Finnhub (OANDA:EUR_USD и т.п.)
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
-        td = fx_to_td(sym)
-        return fetch_twelvedata_klines(td, interval), td, "TD"
+        fh_sym = fx_to_fh(sym)
+        d = fetch_finnhub_candles("FX", fh_sym, interval)
+        return d, fh_sym, "FH"
 
-    return fetch_twelvedata_klines(sym, interval), sym, "TD"
+    # 3) Акции (US и .ME) — через Finnhub stock candles
+    fh_sym = sym
+    d = fetch_finnhub_candles("STOCK", fh_sym, interval)
+    return d, fh_sym, "FH"
 
 # ================= PLAN =====================
 
@@ -391,7 +425,7 @@ def process_symbol(kind: str, name: str) -> bool:
     dual  = max([x for x in (open4, open1) if x is not None])
 
     sym = n4 or n1 or name
-    src = "BB" if "BB" in (s4, s1) else "TD"
+    src = "BB" if "BB" in (s4, s1) else "FH"
 
     sent = False
 
