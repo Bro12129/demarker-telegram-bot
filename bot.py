@@ -58,12 +58,20 @@ STATE = load_state(STATE_PATH)
 # ================= TELEGRAM =====================
 
 def _chat_tokens() -> List[str]:
+    """
+    Отправляем сигналы строго только в группы / супергруппы.
+    Личные чаты (положительный chat_id) полностью исключены.
+    """
     if not TELEGRAM_CHAT:
         return []
+
     out: List[str] = []
     for x in TELEGRAM_CHAT.split(","):
         x = x.strip()
-        if x:
+        if not x:
+            continue
+        # Только супергруппы / группы с id вида -100...
+        if x.startswith("-100"):
             out.append(x)
     return out
 
@@ -351,15 +359,14 @@ def fetch_crypto(base: str, interval: str):
     return d, fh_sym, "FH"
 
 def fetch_other(sym: str, interval: str):
-    # 1) Все, что на Bybit как USDT-перпы/CFD: сначала пробуем Bybit
+    # 1) Всё, что на Bybit как USDT-перп/CFD: сначала пробуем Bybit
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
-        # если Bybit ничего не дал — альтернативы здесь не навязываем
         return None, sym, "BB"
 
-    # 2) FX через Finnhub (OANDA:EUR_USD и т.п.)
+    # 2) FX через Finnhub (OANDA:EUR_USD)
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         fh_sym = fx_to_fh(sym)
         d = fetch_finnhub_candles("FX", fh_sym, interval)
