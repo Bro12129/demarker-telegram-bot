@@ -1,5 +1,9 @@
-# bot.py — FIXED VERSION (signals restored)
+# bot.py — Bybit + ALT (Finnhub как абстрактный резерв)
 # Closed candles only, DeMarker(28), wick>=25%, engulfing
+# Signals:
+#   ⚡ / ⚡🕯️  — 4H & 1D same zone
+#   1TF4H     — зона + паттерн только на 4H
+#   1TF1D     — зона + паттерн только на 1D
 
 import os, time, json, requests
 from typing import List, Dict, Optional
@@ -18,7 +22,14 @@ KLINE_4H         = os.getenv("KLINE_4H", "4h")
 KLINE_1D         = os.getenv("KLINE_1D", "1d")
 
 POLL_SECONDS     = 60
-FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "")
+
+BYBIT_BASE       = os.getenv("BYBIT_BASE", "https://api.bybit.com")
+BB_KLINES        = f"{BYBIT_BASE}/v5/market/kline"
+BB_TIMEOUT       = 15
+
+ALT_API_KEY      = os.getenv("FINNHUB_API_KEY", "")   # абстрактный резервный API
+ALT_BASE         = "https://finnhub.io/api/v1"
+ALT_TIMEOUT      = 15
 
 # ================= STATE =====================
 
@@ -168,10 +179,6 @@ def format_signal(symbol, sig, zone, src):
 
 # ================= BYBIT =====================
 
-BYBIT_BASE=os.getenv("BYBIT_BASE","https://api.bybit.com")
-BB_KLINES=f"{BYBIT_BASE}/v5/market/kline"
-BB_TIMEOUT=15
-
 def fetch_bybit_klines(symbol, interval, category, limit=600):
     iv="240" if interval=="4h" else ("D" if interval=="1d" else interval)
     try:
@@ -193,40 +200,40 @@ def fetch_bybit_klines(symbol, interval, category, limit=600):
     except:
         return None
 
-# ================= FINNHUB =====================
+# ================= ALT (резервный источник) =====================
 
-FINNHUB_BASE="https://finnhub.io/api/v1"
-FH_TIMEOUT=15
-
-def fx_to_fh(sym):
+def fx_to_alt(sym):
     s=sym.upper()
     if len(s)==6 and s[:3].isalpha() and s[3:].isalpha():
         return f"OANDA:{s[:3]}_{s[3:]}"
     return s
 
-def crypto_base_to_fh(base):
+def crypto_base_to_alt(base):
     return f"BINANCE:{base.upper()}USDT"
 
-def fetch_finnhub_candles(kind,symbol,interval):
-    if not FINNHUB_API_KEY: return None
+def fetch_alt_candles(kind, symbol, interval):
+    if not ALT_API_KEY:
+        return None
     if interval=="4h":
         res="240"; span_days=200
     else:
-        res="D"; span_days=800
+        res="D";   span_days=800
     to_ts=int(time.time())
     from_ts=to_ts-span_days*86400
+
     if kind=="CRYPTO": path="/crypto/candle"
     elif kind=="FX":   path="/forex/candle"
     else:              path="/stock/candle"
+
     try:
         r=requests.get(
-            FINNHUB_BASE+path,
+            ALT_BASE+path,
             params={
                 "symbol":symbol,"resolution":res,
                 "from":from_ts,"to":to_ts,
-                "token":FINNHUB_API_KEY
+                "token":ALT_API_KEY
             },
-            timeout=FH_TIMEOUT
+            timeout=ALT_TIMEOUT
         )
         if r.status_code!=200: return None
         j=r.json()
@@ -236,8 +243,8 @@ def fetch_finnhub_candles(kind,symbol,interval):
         c=j.get("c") or []
         out=[]; n=min(len(t),len(o),len(h),len(l),len(c))
         for i in range(n):
-            ts=int(t[i]); oo=float(o[i])
-            hh=float(h[i]); ll=float(l[i]); cc=float(c[i])
+            ts=int(t[i]); oo=float(o[i]); hh=float(h[i])
+            ll=float(l[i]); cc=float(c[i])
             if hh<=0 or ll<=0: continue
             out.append([ts,oo,hh,ll,cc])
         out.sort(key=lambda x:x[0])
@@ -275,35 +282,41 @@ FX=["EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"]
 # ================= FETCH ROUTERS =====================
 
 def fetch_crypto(base,interval):
-    bb_lin=base+"USDT"
-    d=fetch_bybit_klines(bb_lin,interval,"linear")
+    # Bybit — основной источник
+    bb_lin = base+"USDT"
+    d = fetch_bybit_klines(bb_lin,interval,"linear")
     if d: return d,bb_lin,"BB"
 
-    bb_perp=base+"PERP"
-    d=fetch_bybit_klines(bb_perp,interval,"linear")
+    bb_perp = base+"PERP"
+    d = fetch_bybit_klines(bb_perp,interval,"linear")
     if d: return d,bb_perp,"BB"
 
-    d=fetch_bybit_klines(bb_lin,interval,"spot")
+    d = fetch_bybit_klines(bb_lin,interval,"spot")
     if d: return d,bb_lin,"BB"
 
-    fh_sym=crypto_base_to_fh(base)
-    d=fetch_finnhub_candles("CRYPTO",fh_sym,interval)
-    return d,fh_sym,"FH"
+    # ALT — резерв
+    alt_sym = crypto_base_to_alt(base)
+    d = fetch_alt_candles("CRYPTO",alt_sym,interval)
+    return d,alt_sym,"ALT"
 
 def fetch_other(sym,interval):
+    # USDT-инструменты — сначала Bybit
     if sym.endswith("USDT"):
-        d=fetch_bybit_klines(sym,interval,"linear")
+        d = fetch_bybit_klines(sym,interval,"linear")
         if d: return d,sym,"BB"
+        # здесь можно добавить spot при желании
         return None,sym,"BB"
 
+    # FX — только ALT
     if len(sym)==6 and sym[:3].isalpha() and sym[3:].isalpha():
-        fh_sym=fx_to_fh(sym)
-        d=fetch_finnhub_candles("FX",fh_sym,interval)
-        return d,fh_sym,"FH"
+        alt_sym = fx_to_alt(sym)
+        d = fetch_alt_candles("FX",alt_sym,interval)
+        return d,alt_sym,"ALT"
 
-    fh_sym=sym
-    d=fetch_finnhub_candles("STOCK",fh_sym,interval)
-    return d,fh_sym,"FH"
+    # Акции US / .ME — только ALT
+    alt_sym = sym
+    d = fetch_alt_candles("STOCK",alt_sym,interval)
+    return d,alt_sym,"ALT"
 
 # ================= PLAN =====================
 
@@ -330,7 +343,8 @@ def process_symbol(kind,name):
         k1_raw,n1,s1=fetch_other(name,KLINE_1D)
 
     have4=bool(k4_raw); have1=bool(k1_raw)
-    if not have4 and not have1: return False
+    if not have4 and not have1:
+        return False
 
     k4=closed_ohlc(k4_raw) if have4 else None
     k1=closed_ohlc(k1_raw) if have1 else None
@@ -354,25 +368,24 @@ def process_symbol(kind,name):
     dual  = max([x for x in (open4,open1) if x is not None])
 
     sym = n4 or n1 or name
-    src = "BB" if "BB" in (s4,s1) else "FH"
+    src = "BB" if "BB" in (s4,s1) else "ALT"
 
     sent=False
 
-    # ===== RESTORED =====
-    # 1) LIGHT or L+CAN — если 4H & 1D в одной зоне
+    # 1) LIGHT / L+CAN — 4H и 1D в одной зоне
     if z4 and z1 and z4==z1:
         sig="L+CAN" if (pat4 or pat1) else "LIGHT"
         key=f"{sym}|{sig}|{z4}|{dual}|{src}"
         sent|=_broadcast_signal(format_signal(sym,sig,z4,src),key)
 
-    # 2) 1TF4H
-    if have4 and z4 and pat4:
+    # 2) 1TF4H — зона только на 4H + паттерн на 4H
+    if have4 and z4 and pat4 and not (z1 and z1==z4):
         sig="1TF4H"
         key=f"{sym}|{sig}|{z4}|{open4}|{src}"
         sent|=_broadcast_signal(format_signal(sym,sig,z4,src),key)
 
-    # 3) 1TF1D
-    if have1 and z1 and pat1:
+    # 3) 1TF1D — зона только на 1D + паттерн на 1D
+    if have1 and z1 and pat1 and not (z4 and z4==z1):
         sig="1TF1D"
         key=f"{sym}|{sig}|{z1}|{open1}|{src}"
         sent|=_broadcast_signal(format_signal(sym,sig,z1,src),key)
@@ -387,6 +400,12 @@ def main():
     if plan_preview:
         print(f"Loaded {len(plan_preview)} symbols for scan.", flush=True)
         print(f"First symbol checked: {plan_preview[0][1]}", flush=True)
+
+    # стартовый пинг: если его нет в группе — проблема в TOKEN/CHAT_ID
+    try:
+        _broadcast_signal("START", f"START|{int(time.time())}")
+    except:
+        pass
 
     while True:
         plan=build_plan()
