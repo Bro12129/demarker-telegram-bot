@@ -459,6 +459,13 @@ def process_symbol(kind: str, name: str) -> bool:
 # ================= MAIN =====================
 
 def main():
+    # Стартовые три строки логов, чтобы видеть, что бот жив
+    plan_preview = build_plan()
+    print(f"INFO: Symbols loaded: {len(plan_preview)}", flush=True)
+    if plan_preview:
+        print(f"Loaded {len(plan_preview)} symbols for scan.", flush=True)
+        print(f"First symbol checked: {plan_preview[0][1]}", flush=True)
+
     while True:
         plan = build_plan()
         for kind, name in plan:
