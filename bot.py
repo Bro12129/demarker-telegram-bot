@@ -1,9 +1,9 @@
 # bot.py — Bybit + Finnhub (crypto/FX/indices/stocks/RU .ME); 4H+1D
-# Только закрытые свечи, DeMarker(28), wick>=25%, engulfing
-# Сигналы:
-#   ⚡ / ⚡🕯️  — совпадение 4H и 1D
-#   1TF4H     — 4H + свечной паттерн
-#   1TF1D     — 1D + свечной паттерн
+# Only closed candles, DeMarker(28), wick>=25%, engulfing
+# Signals:
+#   ⚡ / ⚡🕯️  — 4H & 1D in same zone
+#   1TF4H     — 4H + candle pattern
+#   1TF1D     — 1D + candle pattern
 
 import os, time, json, requests
 from datetime import datetime
@@ -59,8 +59,8 @@ STATE = load_state(STATE_PATH)
 
 def _chat_tokens() -> List[str]:
     """
-    Отправляем сигналы строго только в группы / супергруппы.
-    Личные чаты (положительный chat_id) полностью исключены.
+    Use only group/supergroup IDs (Telegram chat_id starting with -100).
+    Personal chats (positive chat_id) are ignored.
     """
     if not TELEGRAM_CHAT:
         return []
@@ -70,7 +70,6 @@ def _chat_tokens() -> List[str]:
         x = x.strip()
         if not x:
             continue
-        # Только супергруппы / группы с id вида -100...
         if x.startswith("-100"):
             out.append(x)
     return out
@@ -101,9 +100,12 @@ def _broadcast_signal(text: str, signal_key: str) -> bool:
             sent_any = True
     return sent_any
 
-# ================= CLOSE BARS =====================
+# ================= CLOSED BARS =====================
 
 def closed_ohlc(ohlc: Optional[List[List[float]]]) -> List[List[float]]:
+    """
+    Return all bars except the very last one (work only on closed candles).
+    """
     if not ohlc or len(ohlc) < 2:
         return []
     return ohlc[:-1]
@@ -147,6 +149,9 @@ def zone_of(v):
     return None
 
 def wick_ge_body_pct(o: List[List[float]], idx: int, pct=0.25) -> bool:
+    """
+    Wick >= pct * body for either upper or lower wick.
+    """
     if not o:
         return False
     if not (-len(o) <= idx < len(o)):
@@ -160,6 +165,11 @@ def wick_ge_body_pct(o: List[List[float]], idx: int, pct=0.25) -> bool:
     return (upper >= pct*body) or (lower >= pct*body)
 
 def engulfing_with_prior4(o: List[List[float]]) -> bool:
+    """
+    3 closed candles:
+    - last is engulfing
+    - previous two form prior mini-trend
+    """
     if not o or len(o) < 3:
         return False
     o2, h2, l2, c2 = o[-1][1:5]
@@ -174,12 +184,18 @@ def engulfing_with_prior4(o: List[List[float]]) -> bool:
     return bull or bear
 
 def candle_pattern(ohlc: List[List[float]]) -> bool:
+    """
+    Combined candle pattern:
+      - wick >= 25% body
+      - OR engulfing with prior mini-trend
+    Works only on closed candles.
+    """
     o = closed_ohlc(ohlc)
     if len(o) < 3:
         return False
     return wick_ge_body_pct(o, -1, 0.25) or engulfing_with_prior4(o)
 
-# ================= FORMAT TICKER =====================
+# ================= TICKER FORMAT =====================
 
 def is_fx_sym(sym: str) -> bool:
     s = "".join(ch for ch in sym.upper() if ch.isalpha())
@@ -297,7 +313,7 @@ def fetch_finnhub_candles(kind: str, symbol: str, interval: str):
     except:
         return None
 
-# ================= TICKERS =====================
+# ================= TICKER LISTS =====================
 
 CRYPTO = [
     "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX",
@@ -336,7 +352,7 @@ FX = [
 # ================= FETCH ROUTERS =====================
 
 def fetch_crypto(base: str, interval: str):
-    # 1) Bybit linear USDT
+    # 1) Bybit USDT linear contract
     bb_lin = base + "USDT"
     d = fetch_bybit_klines(bb_lin, interval, "linear")
     if d:
@@ -359,20 +375,20 @@ def fetch_crypto(base: str, interval: str):
     return d, fh_sym, "FH"
 
 def fetch_other(sym: str, interval: str):
-    # 1) Всё, что на Bybit как USDT-перп/CFD: сначала пробуем Bybit
+    # 1) Symbols with USDT on Bybit (indices, metals, energy, etc.)
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
         return None, sym, "BB"
 
-    # 2) FX через Finnhub (OANDA:EUR_USD)
+    # 2) FX via Finnhub (OANDA:EUR_USD)
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         fh_sym = fx_to_fh(sym)
         d = fetch_finnhub_candles("FX", fh_sym, interval)
         return d, fh_sym, "FH"
 
-    # 3) Акции (US и .ME) — через Finnhub stock candles
+    # 3) Stocks (US and .ME) via Finnhub stock candles
     fh_sym = sym
     d = fetch_finnhub_candles("STOCK", fh_sym, interval)
     return d, fh_sym, "FH"
@@ -393,7 +409,7 @@ def build_plan():
 # ================= CORE =====================
 
 def process_symbol(kind: str, name: str) -> bool:
-    # грузим оба таймфрейма, но 1TF-сигналы могут работать и по одному
+    # Load both TFs; 1TF signals can work even if only one TF is available
     if kind == "CRYPTO":
         k4_raw, n4, s4 = fetch_crypto(name, KLINE_4H)
         k1_raw, n1, s1 = fetch_crypto(name, KLINE_1D)
@@ -436,19 +452,19 @@ def process_symbol(kind: str, name: str) -> bool:
 
     sent = False
 
-    # A) Совпадение двух ТФ (4H+1D)
+    # A) 4H + 1D in the same zone (OB/OS)
     if z4 and z1 and z4 == z1:
         sig = "L+CAN" if (pat4 or pat1) else "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
         sent |= _broadcast_signal(format_signal(sym, sig, z4, src), key)
 
-    # B) 1TF4H — только 4 часа: крайность + свеча
+    # B) 1TF4H — extreme + candle pattern on 4H
     if have4 and z4 and pat4:
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
         sent |= _broadcast_signal(format_signal(sym, sig, z4, src), key)
 
-    # C) 1TF1D — только день: крайность + свеча
+    # C) 1TF1D — extreme + candle pattern on 1D
     if have1 and z1 and pat1:
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
@@ -459,7 +475,7 @@ def process_symbol(kind: str, name: str) -> bool:
 # ================= MAIN =====================
 
 def main():
-    # Стартовые три строки логов, чтобы видеть, что бот жив
+    # Minimal startup logs, one-time
     plan_preview = build_plan()
     print(f"INFO: Symbols loaded: {len(plan_preview)}", flush=True)
     if plan_preview:
