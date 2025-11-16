@@ -1,9 +1,9 @@
 # bot.py — Bybit + ALT (резерв), с DEBUG
-# Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением), engulfing
+# Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
-#   ⚡        — 4H & 1D same zone + свечной паттерн
-#   1TF4H     — зона + паттерн только на 4H
-#   1TF1D     — зона + паттерн только на 1D
+#   ⚡        — 4H & 1D same zone + pin-bar
+#   1TF4H     — зона + pin-bar только на 4H
+#   1TF1D     — зона + pin-bar только на 1D
 
 import os, time, json, requests
 from typing import List, Dict, Optional
@@ -141,8 +141,7 @@ def zone_of(v):
 # ========== PIN-BAR (wick>=30%, направленный) ==========
 
 def pinbar_by_zone(o, idx, zone, pct=0.30):
-    """Направленный pin-bar по зоне:
-       OB — верхний фитиль >= pct*body;
+    """OB — верхний фитиль >= pct*body;
        OS — нижний фитиль >= pct*body.
     """
     if zone not in ("OB","OS"):
@@ -161,10 +160,10 @@ def pinbar_by_zone(o, idx, zone, pct=0.30):
         return lower >= pct * body
     return False
 
-# ========== ENGULFING (как было) ==========
-
+# оставляем функцию engulfing, но НЕ используем в сигналах
 def engulfing_with_prior4(o):
-    if len(o)<3: return False
+    if len(o)<3:
+        return False
     o2,h2,l2,c2 = o[-1][1:5]
     o3,h3,l3,c3 = o[-2][1:5]
     o4,h4,l4,c4 = o[-3][1:5]
@@ -175,13 +174,13 @@ def engulfing_with_prior4(o):
     return bull or bear
 
 def candle_pattern(o, zone):
-    """Любой свечной паттерн: направленный pin-bar ИЛИ engulfing."""
+    """Паттерн = ТОЛЬКО pin-bar по зоне."""
     o2 = closed_ohlc(o)
-    if len(o2) < 3:
+    if len(o2) < 2:
         return False
-    pin = pinbar_by_zone(o2, -1, zone, 0.30) if zone in ("OB","OS") else False
-    eng = engulfing_with_prior4(o2)
-    return bool(pin or eng)
+    if zone not in ("OB","OS"):
+        return False
+    return pinbar_by_zone(o2, -1, zone, 0.30)
 
 # ================= FORMAT =====================
 
@@ -198,7 +197,7 @@ def to_display(sym):
 
 def format_signal(symbol, sig, zone, src):
     arrow = "🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
-    status = "⚡" if sig=="LIGHT" else ""  # свечки 🕯️ больше нет
+    status = "⚡" if sig=="LIGHT" else ""
     return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
 # ================= BYBIT =====================
@@ -306,7 +305,6 @@ FX=["EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"]
 # ================= FETCH ROUTERS =====================
 
 def fetch_crypto(base,interval):
-    # Bybit — основной источник
     bb_lin = base+"USDT"
     d = fetch_bybit_klines(bb_lin,interval,"linear")
     if d: return d,bb_lin,"BB"
@@ -318,25 +316,21 @@ def fetch_crypto(base,interval):
     d = fetch_bybit_klines(bb_lin,interval,"spot")
     if d: return d,bb_lin,"BB"
 
-    # ALT — резерв
     alt_sym = crypto_base_to_alt(base)
     d = fetch_alt_candles("CRYPTO",alt_sym,interval)
     return d,alt_sym,"ALT"
 
 def fetch_other(sym,interval):
-    # USDT-инструменты — сначала Bybit
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym,interval,"linear")
         if d: return d,sym,"BB"
         return None,sym,"BB"
 
-    # FX — только ALT
     if len(sym)==6 and sym[:3].isalpha() and sym[3:].isalpha():
         alt_sym = fx_to_alt(sym)
         d = fetch_alt_candles("FX",alt_sym,interval)
         return d,alt_sym,"ALT"
 
-    # Акции US / .ME — только ALT
     alt_sym = sym
     d = fetch_alt_candles("STOCK",alt_sym,interval)
     return d,alt_sym,"ALT"
@@ -357,7 +351,6 @@ def build_plan():
 # ================= DEBUG =====================
 
 def debug_btc():
-    """DEBUG по BTC: зоны 4H/1D + паттерны."""
     try:
         k4_raw, n4, s4 = fetch_crypto("BTC", KLINE_4H)
         k1_raw, n1, s1 = fetch_crypto("BTC", KLINE_1D)
@@ -440,19 +433,19 @@ def process_symbol(kind,name):
 
     sent=False
 
-    # 1) LIGHT — 4H и 1D в одной зоне + ОБЯЗАТЕЛЬНО есть паттерн
+    # 1) LIGHT — 4H и 1D в одной зоне + ОБЯЗАТЕЛЬНО есть pin-bar
     if z4 and z1 and z4==z1 and (pat4 or pat1):
         sig="LIGHT"
         key=f"{sym}|{sig}|{z4}|{dual}|{src}"
         sent|=_broadcast_signal(format_signal(sym,sig,z4,src),key)
 
-    # 2) 1TF4H — зона только на 4H + паттерн на 4H
+    # 2) 1TF4H — зона только на 4H + pin-bar на 4H
     if have4 and z4 and pat4 and not (z1 and z1==z4):
         sig="1TF4H"
         key=f"{sym}|{sig}|{z4}|{open4}|{src}"
         sent|=_broadcast_signal(format_signal(sym,sig,z4,src),key)
 
-    # 3) 1TF1D — зона только на 1D + паттерн на 1D
+    # 3) 1TF1D — зона только на 1D + pin-bar на 1D
     if have1 and z1 and pat1 and not (z4 and z4==z1):
         sig="1TF1D"
         key=f"{sym}|{sig}|{z1}|{open1}|{src}"
@@ -469,10 +462,9 @@ def main():
         print(f"Loaded {len(plan_preview)} symbols for scan.", flush=True)
         print(f"First symbol checked: {plan_preview[0][1]}", flush=True)
 
-    # стартовый пинг + моментальный DEBUG
     try:
         _broadcast_signal("START", f"START|{int(time.time())}")
-        debug_btc()  # сразу при старте
+        debug_btc()
         STATE["last_debug"] = int(time.time())
         save_state(STATE_PATH, STATE)
     except:
@@ -484,10 +476,8 @@ def main():
             process_symbol(kind,name)
             time.sleep(1)
 
-        # GC + плановое сохранение
         gc_state(STATE,21)
 
-        # периодический DEBUG раз в 6 часов
         now = int(time.time())
         if now - int(STATE.get("last_debug", 0)) >= DEBUG_INTERVAL:
             debug_btc()
