@@ -1,7 +1,7 @@
 # bot.py — Bybit + ALT (резерв), с DEBUG
-# Closed candles only, DeMarker(28), wick>=25%, engulfing
+# Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением), engulfing
 # Signals:
-#   ⚡ / ⚡🕯️  — 4H & 1D same zone
+#   ⚡        — 4H & 1D same zone + свечной паттерн
 #   1TF4H     — зона + паттерн только на 4H
 #   1TF1D     — зона + паттерн только на 1D
 
@@ -138,14 +138,30 @@ def zone_of(v):
     if v<=DEM_OS: return "OS"
     return None
 
-def wick_ge_body_pct(o, idx, pct=0.25):
-    if not o or not (-len(o)<=idx<len(o)): return False
+# ========== PIN-BAR (wick>=30%, направленный) ==========
+
+def pinbar_by_zone(o, idx, zone, pct=0.30):
+    """Направленный pin-bar по зоне:
+       OB — верхний фитиль >= pct*body;
+       OS — нижний фитиль >= pct*body.
+    """
+    if zone not in ("OB","OS"):
+        return False
+    if not o or not (-len(o)<=idx<len(o)):
+        return False
     o_,h_,l_,c_ = o[idx][1:5]
-    body=abs(c_-o_)
-    if body<=0: return False
-    upper=h_-max(o_,c_)
-    lower=min(o_,c_)-l_
-    return (upper>=pct*body) or (lower>=pct*body)
+    body = abs(c_ - o_)
+    if body <= 0:
+        return False
+    upper = h_ - max(o_, c_)
+    lower = min(o_, c_) - l_
+    if zone == "OB":
+        return upper >= pct * body
+    if zone == "OS":
+        return lower >= pct * body
+    return False
+
+# ========== ENGULFING (как было) ==========
 
 def engulfing_with_prior4(o):
     if len(o)<3: return False
@@ -158,10 +174,14 @@ def engulfing_with_prior4(o):
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
 
-def candle_pattern(o):
-    o2=closed_ohlc(o)
-    if len(o2)<3: return False
-    return wick_ge_body_pct(o2,-1,0.25) or engulfing_with_prior4(o2)
+def candle_pattern(o, zone):
+    """Любой свечной паттерн: направленный pin-bar ИЛИ engulfing."""
+    o2 = closed_ohlc(o)
+    if len(o2) < 3:
+        return False
+    pin = pinbar_by_zone(o2, -1, zone, 0.30) if zone in ("OB","OS") else False
+    eng = engulfing_with_prior4(o2)
+    return bool(pin or eng)
 
 # ================= FORMAT =====================
 
@@ -177,8 +197,8 @@ def to_display(sym):
     return s
 
 def format_signal(symbol, sig, zone, src):
-    arrow="🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
-    status = "⚡" if sig=="LIGHT" else ("⚡🕯️" if sig=="L+CAN" else "🕯️")
+    arrow = "🟢↑" if zone=="OS" else ("🔴↓" if zone=="OB" else "")
+    status = "⚡" if sig=="LIGHT" else ""  # свечки 🕯️ больше нет
     return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
 # ================= BYBIT =====================
@@ -364,8 +384,8 @@ def debug_btc():
         z4 = zone_of(v4)
         z1 = zone_of(v1)
 
-        pat4 = candle_pattern(k4) if have4 else False
-        pat1 = candle_pattern(k1) if have1 else False
+        pat4 = candle_pattern(k4, z4) if have4 else False
+        pat1 = candle_pattern(k1, z1) if have1 else False
 
         sym = n4 or n1 or "BTC"
         src = "BB" if "BB" in (s4,s1) else "ALT"
@@ -408,8 +428,8 @@ def process_symbol(kind,name):
     z4=zone_of(v4)
     z1=zone_of(v1)
 
-    pat4=candle_pattern(k4) if have4 else False
-    pat1=candle_pattern(k1) if have1 else False
+    pat4=candle_pattern(k4, z4) if have4 else False
+    pat1=candle_pattern(k1, z1) if have1 else False
 
     open4 = k4[-1][0] if have4 else None
     open1 = k1[-1][0] if have1 else None
@@ -420,9 +440,9 @@ def process_symbol(kind,name):
 
     sent=False
 
-    # 1) LIGHT / L+CAN — 4H и 1D в одной зоне
-    if z4 and z1 and z4==z1:
-        sig="L+CAN" if (pat4 or pat1) else "LIGHT"
+    # 1) LIGHT — 4H и 1D в одной зоне + ОБЯЗАТЕЛЬНО есть паттерн
+    if z4 and z1 and z4==z1 and (pat4 or pat1):
+        sig="LIGHT"
         key=f"{sym}|{sig}|{z4}|{dual}|{src}"
         sent|=_broadcast_signal(format_signal(sym,sig,z4,src),key)
 
