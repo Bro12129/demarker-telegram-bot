@@ -1,4 +1,4 @@
-# bot.py — Bybit + ALT (резерв), с DEBUG
+# bot.py — Bybit + ALT (резерв), с DEBUG и кэшем Finnhub
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
 #   ⚡        — 4H & 1D same zone + pin-bar
@@ -32,6 +32,10 @@ ALT_BASE         = "https://finnhub.io/api/v1"
 ALT_TIMEOUT      = 15
 
 DEBUG_INTERVAL   = 6 * 3600  # 6 часов
+
+# кэш для Finnhub: (kind, symbol, interval) -> (ts, data)
+ALT_CACHE: Dict = {}
+ALT_REFRESH_SEC  = int(os.getenv("ALT_REFRESH_SEC", "3600"))  # раз в час; можно 7200
 
 # ================= STATE =====================
 
@@ -243,8 +247,19 @@ def ru_to_alt(sym: str) -> str:
     return sym
 
 def fetch_alt_candles(kind, symbol, interval):
+    """Запрос к Finnhub с кэшем, чтобы не бить бесплатный тариф."""
     if not ALT_API_KEY:
         return None
+
+    key = (kind, symbol, interval)
+    now = time.time()
+
+    # вернуть из кэша, если ещё не истёк ALT_REFRESH_SEC
+    if key in ALT_CACHE:
+        ts, data = ALT_CACHE[key]
+        if now - ts < ALT_REFRESH_SEC:
+            return data
+
     if interval=="4h":
         res="240"; span_days=200
     else:
@@ -266,19 +281,26 @@ def fetch_alt_candles(kind, symbol, interval):
             },
             timeout=ALT_TIMEOUT
         )
-        if r.status_code!=200: return None
+        if r.status_code!=200:
+            return None
         j=r.json()
-        if j.get("s")!="ok": return None
+        if j.get("s")!="ok":
+            return None
         t=j.get("t") or []; o=j.get("o") or []
         h=j.get("h") or []; l=j.get("l") or []
         c=j.get("c") or []
         out=[]; n=min(len(t),len(o),len(h),len(l),len(c))
         for i in range(n):
-            ts=int(t[i]); oo=float(o[i]); hh=float(h[i])
+            ts_i=int(t[i]); oo=float(o[i]); hh=float(h[i])
             ll=float(l[i]); cc=float(c[i])
-            if hh<=0 or ll<=0: continue
-            out.append([ts,oo,hh,ll,cc])
+            if hh<=0 or ll<=0:
+                continue
+            out.append([ts_i,oo,hh,ll,cc])
         out.sort(key=lambda x:x[0])
+
+        # кэшируем только, если что-то есть
+        if out:
+            ALT_CACHE[key] = (now, out)
         return out
     except:
         return None
@@ -313,6 +335,7 @@ FX=["EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"]
 # ================= FETCH ROUTERS =====================
 
 def fetch_crypto(base,interval):
+    # сначала Bybit (линейные, потом перпы, потом спот)
     bb_lin = base+"USDT"
     d = fetch_bybit_klines(bb_lin,interval,"linear")
     if d: return d,bb_lin,"BB"
@@ -324,6 +347,7 @@ def fetch_crypto(base,interval):
     d = fetch_bybit_klines(bb_lin,interval,"spot")
     if d: return d,bb_lin,"BB"
 
+    # только если Bybit пустой — идём в Finnhub
     alt_sym = crypto_base_to_alt(base)
     d = fetch_alt_candles("CRYPTO",alt_sym,interval)
     return d,alt_sym,"ALT"
