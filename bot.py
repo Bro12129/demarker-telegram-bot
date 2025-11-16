@@ -234,6 +234,14 @@ def fx_to_alt(sym):
 def crypto_base_to_alt(base):
     return f"BINANCE:{base.upper()}USDT"
 
+def ru_to_alt(sym: str) -> str:
+    """GAZP.ME -> MOEX:GAZP для Finnhub."""
+    u = sym.upper()
+    if u.endswith(".ME"):
+        base = u.split(".")[0]
+        return f"MOEX:{base}"
+    return sym
+
 def fetch_alt_candles(kind, symbol, interval):
     if not ALT_API_KEY:
         return None
@@ -321,17 +329,24 @@ def fetch_crypto(base,interval):
     return d,alt_sym,"ALT"
 
 def fetch_other(sym,interval):
+    # 1) Все ...USDT (индексы, металлы, энергия): Bybit -> если нет, Finnhub как CRYPTO (BINANCE:BASEUSDT)
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym,interval,"linear")
-        if d: return d,sym,"BB"
-        return None,sym,"BB"
+        if d:
+            return d,sym,"BB"
+        base = sym[:-4]
+        alt_sym = crypto_base_to_alt(base)
+        d = fetch_alt_candles("CRYPTO",alt_sym,interval)
+        return d,alt_sym,"ALT"
 
+    # 2) FX 6-символьные: через /forex Finnhub
     if len(sym)==6 and sym[:3].isalpha() and sym[3:].isalpha():
         alt_sym = fx_to_alt(sym)
         d = fetch_alt_candles("FX",alt_sym,interval)
         return d,alt_sym,"ALT"
 
-    alt_sym = sym
+    # 3) Акции, включая RU: GAZP.ME -> MOEX:GAZP
+    alt_sym = ru_to_alt(sym) if sym.upper().endswith(".ME") else sym
     d = fetch_alt_candles("STOCK",alt_sym,interval)
     return d,alt_sym,"ALT"
 
