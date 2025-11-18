@@ -1,4 +1,4 @@
-# bot.py — Bybit + TwelveData (резерв с лимитами), с SERVICE-логами
+# bot.py — Bybit + TwelveData (резерв с лимитами)
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
 #   ⚡        — 4H & 1D same zone + pin-bar
@@ -45,8 +45,6 @@ TD_DAILY_LIMIT   = int(os.getenv("TD_DAILY_LIMIT", "780"))
 # как часто реально обновлять данные по ТФ (по умолчанию достаточно для free-тарифа)
 TD_REFRESH_4H    = int(os.getenv("TD_REFRESH_4H", "7200"))   # 2 часа
 TD_REFRESH_1D    = int(os.getenv("TD_REFRESH_1D", "43200"))  # 12 часов
-
-DEBUG_INTERVAL   = 6 * 3600  # 6 часов
 
 # кэш TwelveData: (symbol, interval) -> (ts_fetch, data)
 TD_CACHE: Dict = {}
@@ -328,7 +326,8 @@ def to_display(sym: str) -> str:
 def format_signal(symbol, sig, zone, src):
     arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
     status = "⚡" if sig == "LIGHT" else ""
-    # src: "BB" (Bybit) или "TD" (TwelveData)
+    # src: "BB" (Bybit) или "TD" (TwelveData) — в сигнале можно оставить,
+    # стратегия всё равно не раскрывается.
     return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
 # ================= BYBIT =====================
@@ -450,46 +449,12 @@ def build_plan():
     for x in RU_STOCKS:  plan.append(("OTHER", x))
     return plan
 
-# ================= SERVICE / HEARTBEAT =====================
+# ================= SERVICE =====================
 
-def debug_btc():
-    """Служебная проверка BTC без раскрытия стратегии."""
+def debug_symbol(sym):
+    """Служебное сообщение после отправки сигнала (без стратегии)."""
     try:
-        k4_raw, n4, s4 = fetch_crypto("BTC", KLINE_4H)
-        k1_raw, n1, s1 = fetch_crypto("BTC", KLINE_1D)
-
-        have4 = bool(k4_raw)
-        have1 = bool(k1_raw)
-
-        if not have4 and not have1:
-            _broadcast_signal(
-                "SERVICE BTC data_issue",
-                f"SERVICE|BTC|{int(time.time())}"
-            )
-            return
-
-        k4 = closed_ohlc(k4_raw) if have4 else None
-        k1 = closed_ohlc(k1_raw) if have1 else None
-        if have4 and not k4: have4 = False
-        if have1 and not k1: have1 = False
-        if not have4 and not have1:
-            _broadcast_signal(
-                "SERVICE BTC no_closed_bars",
-                f"SERVICE|BTC|{int(time.time())}"
-            )
-            return
-
-        sym = n4 or n1 or "BTC"
-        src = "BB" if "BB" in (s4, s1) else "TD"
-        msg = f"SERVICE {to_display(sym)} [{src}] проверка соединения"
-        _broadcast_signal(msg, f"SERVICE|BTC|{int(time.time())}")
-    except:
-        pass
-
-def debug_symbol(sym, src):
-    """Служебное сообщение по конкретному символу без деталей стратегии."""
-    try:
-        msg = f"SERVICE {to_display(sym)} [{src}] действительные параметры"
+        msg = f"SERVICE {to_display(sym)} валид"
         _broadcast_signal(msg, f"SERVICE|{sym}|{int(time.time())}")
     except:
         pass
@@ -507,6 +472,8 @@ def process_symbol(kind, name):
 
     have4 = bool(k4_raw); have1 = bool(k1_raw)
     if not have4 and not have1:
+        # Только в логи, в Telegram не идёт
+        print(f"WARN: no data for {name} ({kind})", flush=True)
         return False
 
     k4 = closed_ohlc(k4_raw) if have4 else None
@@ -514,6 +481,7 @@ def process_symbol(kind, name):
     if have4 and not k4: have4 = False
     if have1 and not k1: have1 = False
     if not have4 and not have1:
+        print(f"WARN: no closed bars for {name} ({kind})", flush=True)
         return False
 
     d4 = demarker_series(k4, DEM_LEN) if have4 else None
@@ -536,7 +504,7 @@ def process_symbol(kind, name):
 
     sent = False
 
-    # 1) LIGHT — 4H и 1D в одной зоне + ОБЯЗАТЕЛЬНО есть pin-bar
+    # 1) LIGHT — 4H и 1D в одной зоне + pin-bar на одном из ТФ
     if z4 and z1 and z4 == z1 and (pat4 or pat1):
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
@@ -558,7 +526,7 @@ def process_symbol(kind, name):
             sent = True
 
     if sent:
-        debug_symbol(sym, src)
+        debug_symbol(sym)
 
     return sent
 
@@ -573,8 +541,6 @@ def main():
 
     try:
         _broadcast_signal("START", f"START|{int(time.time())}")
-        debug_btc()
-        STATE["last_debug"] = int(time.time())
         save_state(STATE_PATH, STATE)
     except:
         pass
@@ -586,12 +552,6 @@ def main():
             time.sleep(1)
 
         gc_state(STATE, 21)
-
-        now = int(time.time())
-        if now - int(STATE.get("last_debug", 0)) >= DEBUG_INTERVAL:
-            debug_btc()
-            STATE["last_debug"] = now
-
         save_state(STATE_PATH, STATE)
         time.sleep(POLL_SECONDS)
 
