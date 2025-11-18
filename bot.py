@@ -1,4 +1,4 @@
-# bot.py — Bybit + TwelveData (резерв с лимитами), с DEBUG
+# bot.py — Bybit + TwelveData (резерв с лимитами), с SERVICE-логами
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
 #   ⚡        — 4H & 1D same zone + pin-bar
@@ -17,8 +17,14 @@ TELEGRAM_CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_API           = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 DEM_LEN          = int(os.getenv("DEM_LEN", "28"))
-DEM_OB           = float(os.getenv("DEM_OB", "0.70"))
-DEM_OS           = float(os.getenv("DEM_OS", "0.30"))
+
+# Порог для 4H
+DEM_OB_4H        = float(os.getenv("DEM_OB_4H", "0.70"))
+DEM_OS_4H        = float(os.getenv("DEM_OS_4H", "0.30"))
+# Порог для 1D
+DEM_OB_1D        = float(os.getenv("DEM_OB_1D", "0.71"))
+DEM_OS_1D        = float(os.getenv("DEM_OS_1D", "0.29"))
+
 KLINE_4H         = os.getenv("KLINE_4H", "4h")
 KLINE_1D         = os.getenv("KLINE_1D", "1d")
 
@@ -245,11 +251,18 @@ def last_closed(series):
         i -= 1
     return series[i] if i >= 0 else None
 
-def zone_of(v):
+def zone_of(v, tf: str):
+    """Определяем зону по разным порогам для 4H и 1D."""
     if v is None:
         return None
-    if v >= DEM_OB: return "OB"
-    if v <= DEM_OS: return "OS"
+    if tf == "4H":
+        ob, os_ = DEM_OB_4H, DEM_OS_4H
+    else:
+        ob, os_ = DEM_OB_1D, DEM_OS_1D
+    if v >= ob:
+        return "OB"
+    if v <= os_:
+        return "OS"
     return None
 
 # ========== PIN-BAR (wick>=30%, направленный) ==========
@@ -437,17 +450,22 @@ def build_plan():
     for x in RU_STOCKS:  plan.append(("OTHER", x))
     return plan
 
-# ================= DEBUG =====================
+# ================= SERVICE / HEARTBEAT =====================
 
 def debug_btc():
+    """Служебная проверка BTC без раскрытия стратегии."""
     try:
         k4_raw, n4, s4 = fetch_crypto("BTC", KLINE_4H)
         k1_raw, n1, s1 = fetch_crypto("BTC", KLINE_1D)
 
         have4 = bool(k4_raw)
         have1 = bool(k1_raw)
+
         if not have4 and not have1:
-            _broadcast_signal("DEBUG BTC no data", f"DEBUG|BTC|{int(time.time())}")
+            _broadcast_signal(
+                "SERVICE BTC data_issue",
+                f"SERVICE|BTC|{int(time.time())}"
+            )
             return
 
         k4 = closed_ohlc(k4_raw) if have4 else None
@@ -455,29 +473,24 @@ def debug_btc():
         if have4 and not k4: have4 = False
         if have1 and not k1: have1 = False
         if not have4 and not have1:
-            _broadcast_signal("DEBUG BTC no closed bars", f"DEBUG|BTC|{int(time.time())}")
+            _broadcast_signal(
+                "SERVICE BTC no_closed_bars",
+                f"SERVICE|BTC|{int(time.time())}"
+            )
             return
-
-        d4 = demarker_series(k4, DEM_LEN) if have4 else None
-        d1 = demarker_series(k1, DEM_LEN) if have1 else None
-        v4 = last_closed(d4) if d4 else None
-        v1 = last_closed(d1) if d1 else None
-
-        z4 = zone_of(v4)
-        z1 = zone_of(v1)
-
-        pat4 = candle_pattern(k4, z4) if have4 else False
-        pat1 = candle_pattern(k1, z1) if have1 else False
 
         sym = n4 or n1 or "BTC"
         src = "BB" if "BB" in (s4, s1) else "TD"
+        msg = f"SERVICE {to_display(sym)} [{src}] проверка соединения"
+        _broadcast_signal(msg, f"SERVICE|BTC|{int(time.time())}")
+    except:
+        pass
 
-        msg = (
-            f"DEBUG {to_display(sym)} [{src}] "
-            f"4H={z4 or 'NONE'} 1D={z1 or 'NONE'} "
-            f"pat4={int(bool(pat4))} pat1={int(bool(pat1))}"
-        )
-        _broadcast_signal(msg, f"DEBUG|BTC|{int(time.time())}")
+def debug_symbol(sym, src):
+    """Служебное сообщение по конкретному символу без деталей стратегии."""
+    try:
+        msg = f"SERVICE {to_display(sym)} [{src}] действительные параметры"
+        _broadcast_signal(msg, f"SERVICE|{sym}|{int(time.time())}")
     except:
         pass
 
@@ -508,8 +521,8 @@ def process_symbol(kind, name):
     v4 = last_closed(d4) if d4 else None
     v1 = last_closed(d1) if d1 else None
 
-    z4 = zone_of(v4)
-    z1 = zone_of(v1)
+    z4 = zone_of(v4, "4H")
+    z1 = zone_of(v1, "1D")
 
     pat4 = candle_pattern(k4, z4) if have4 else False
     pat1 = candle_pattern(k1, z1) if have1 else False
@@ -527,19 +540,25 @@ def process_symbol(kind, name):
     if z4 and z1 and z4 == z1 and (pat4 or pat1):
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
-        sent |= _broadcast_signal(format_signal(sym, sig, z4, src), key)
+        if _broadcast_signal(format_signal(sym, sig, z4, src), key):
+            sent = True
 
     # 2) 1TF4H — зона только на 4H + pin-bar на 4H
     if have4 and z4 and pat4 and not (z1 and z1 == z4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
-        sent |= _broadcast_signal(format_signal(sym, sig, z4, src), key)
+        if _broadcast_signal(format_signal(sym, sig, z4, src), key):
+            sent = True
 
     # 3) 1TF1D — зона только на 1D + pin-bar на 1D
     if have1 and z1 and pat1 and not (z4 and z4 == z1):
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
-        sent |= _broadcast_signal(format_signal(sym, sig, z1, src), key)
+        if _broadcast_signal(format_signal(sym, sig, z1, src), key):
+            sent = True
+
+    if sent:
+        debug_symbol(sym, src)
 
     return sent
 
