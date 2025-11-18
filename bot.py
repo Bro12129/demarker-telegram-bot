@@ -1,9 +1,9 @@
 # bot.py — Bybit + TwelveData (резерв с лимитами)
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
-#   ⚡        — 4H & 1D same zone + pin-bar
-#   1TF4H    — зона + pin-bar только на 4H
-#   1TF1D    — зона + pin-bar только на 1D
+#   ⚡        — 4H & 1D same zone + pin-bar / engulfing
+#   1TF4H    — зона + свечной паттерн (pin-bar или engulfing) только на 4H
+#   1TF1D    — зона + свечной паттерн (pin-bar или engulfing) только на 1D
 
 import os, time, json, requests
 from typing import List, Dict, Optional
@@ -285,27 +285,37 @@ def pinbar_by_zone(o, idx, zone, pct=0.30):
         return lower >= pct * body
     return False
 
-# оставляем функцию engulfing, но НЕ используем в сигналах
+# Engulfing с учётом последовательности: -3 и -2 одного цвета, -1 противоположного,
+# и -1 полностью покрывает диапазон -2. Работает по закрытым свечам.
 def engulfing_with_prior4(o):
     if len(o) < 3:
         return False
-    o2, h2, l2, c2 = o[-1][1:5]
-    o3, h3, l3, c3 = o[-2][1:5]
-    o4, h4, l4, c4 = o[-3][1:5]
-    bull2 = c2 >= o2; bull3 = c3 >= o3; bull4 = c4 >= o4
+    o2, h2, l2, c2 = o[-1][1:5]  # -1
+    o3, h3, l3, c3 = o[-2][1:5]  # -2
+    o4, h4, l4, c4 = o[-3][1:5]  # -3
+    bull2 = c2 >= o2
+    bull3 = c3 >= o3
+    bull4 = c4 >= o4
     cover = (min(o2, c2) <= min(o3, c3)) and (max(o2, c2) >= max(o3, c3))
     bull = bull2 and (not bull3) and (not bull4) and cover
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
 
 def candle_pattern(o, zone):
-    """Паттерн = ТОЛЬКО pin-bar по зоне."""
+    """
+    Свечной паттерн:
+      - pin-bar по зоне (wick>=30% и направление по зоне)
+      - ИЛИ engulfing_with_prior4 по последним трём закрытым свечам.
+    """
     o2 = closed_ohlc(o)
-    if len(o2) < 2:
+    if len(o2) < 3:
         return False
     if zone not in ("OB", "OS"):
         return False
-    return pinbar_by_zone(o2, -1, zone, 0.30)
+
+    has_pin = pinbar_by_zone(o2, -1, zone, 0.30)
+    has_eng = engulfing_with_prior4(o2)
+    return has_pin or has_eng
 
 # ================= FORMAT =====================
 
@@ -504,21 +514,21 @@ def process_symbol(kind, name):
 
     sent = False
 
-    # 1) LIGHT — 4H и 1D в одной зоне + pin-bar на одном из ТФ
+    # 1) LIGHT — 4H и 1D в одной зоне + свечной паттерн (pin-bar или engulfing) на одном из ТФ
     if z4 and z1 and z4 == z1 and (pat4 or pat1):
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
-    # 2) 1TF4H — зона только на 4H + pin-bar на 4H
+    # 2) 1TF4H — зона только на 4H + свечной паттерн на 4H
     if have4 and z4 and pat4 and not (z1 and z1 == z4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
-    # 3) 1TF1D — зона только на 1D + pin-bar на 1D
+    # 3) 1TF1D — зона только на 1D + свечной паттерн на 1D
     if have1 and z1 and pat1 and not (z4 and z4 == z1):
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
