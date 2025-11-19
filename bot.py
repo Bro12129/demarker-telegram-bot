@@ -414,7 +414,7 @@ def ru_to_td(sym: str) -> str:
 
 CRYPTO = [
     "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX",
-    "DOT","LINK","LTC","MATIC","TON","ATOM","NEAR"
+    "DOT","LINK","LTC","MATIC","TON","ATOM","NEAR","PEPE"
 ]
 
 INDEX_PERP = [
