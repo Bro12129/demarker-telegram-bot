@@ -2,6 +2,7 @@
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
 #   ⚡        — 4H & 1D same zone + pin-bar / engulfing
+#              ИЛИ отдельный сильный 1D pin-bar (wick>=34% по зоне)
 #   1TF4H    — зона + свечной паттерн (pin-bar или engulfing) только на 4H
 #   1TF1D    — зона + свечной паттерн (pin-bar или engulfing) только на 1D
 
@@ -317,6 +318,35 @@ def candle_pattern(o, zone):
     has_eng = engulfing_with_prior4(o2)
     return has_pin or has_eng
 
+# ================= STRONG PIN-BAR 1D (>=34%) =====================
+
+def strong_pinbar_1d(o, zone, pct=0.34):
+    """
+    Сильный дневной pin-bar:
+      - фитиль >= pct * body
+      - направление строго по зоне:
+            OS → нижний фитиль
+            OB → верхний фитиль
+    """
+    o2 = closed_ohlc(o)
+    if len(o2) < 1 or zone not in ("OB", "OS"):
+        return False
+
+    o_, h_, l_, c_ = o2[-1][1:5]
+    body = abs(c_ - o_)
+    if body <= 0:
+        return False
+
+    upper = h_ - max(o_, c_)
+    lower = min(o_, c_) - l_
+
+    if zone == "OB":
+        return upper >= pct * body
+    if zone == "OS":
+        return lower >= pct * body
+
+    return False
+
 # ================= FORMAT =====================
 
 def is_fx_sym(sym: str) -> bool:
@@ -336,8 +366,7 @@ def to_display(sym: str) -> str:
 def format_signal(symbol, sig, zone, src):
     arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
     status = "⚡" if sig == "LIGHT" else ""
-    # src: "BB" (Bybit) или "TD" (TwelveData) — в сигнале можно оставить,
-    # стратегия всё равно не раскрывается.
+    # src: "BB" (Bybit) или "TD" (TwelveData)
     return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
 # ================= BYBIT =====================
@@ -505,6 +534,11 @@ def process_symbol(kind, name):
     pat4 = candle_pattern(k4, z4) if have4 else False
     pat1 = candle_pattern(k1, z1) if have1 else False
 
+    # сильный дневной pin-bar (>=34% по зоне)
+    strong1 = False
+    if have1 and z1:
+        strong1 = strong_pinbar_1d(k1, z1, pct=0.34)
+
     open4 = k4[-1][0] if have4 else None
     open1 = k1[-1][0] if have1 else None
     dual  = max([x for x in (open4, open1) if x is not None])
@@ -514,11 +548,19 @@ def process_symbol(kind, name):
 
     sent = False
 
-    # 1) LIGHT — 4H и 1D в одной зоне + свечной паттерн (pin-bar или engulfing) на одном из ТФ
+    # 1A) LIGHT — 4H и 1D в одной зоне + свечной паттерн на одном из ТФ
     if z4 and z1 and z4 == z1 and (pat4 or pat1):
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
+            sent = True
+
+    # 1B) LIGHT — дополнительный кейс:
+    #     только дневка в зоне + сильный pin-bar >=34% (4H может быть где угодно)
+    if not sent and z1 and strong1:
+        sig = "LIGHT"
+        key = f"{sym}|{sig}|{z1}|{open1}|{src}"
+        if _broadcast_signal(format_signal(sym, sig, z1, src), key):
             sent = True
 
     # 2) 1TF4H — зона только на 4H + свечной паттерн на 4H
