@@ -154,6 +154,7 @@ def fetch_td_candles(symbol: str, interval: str):
             "interval": "4h" if interval == "4h" else "1day",
             "outputsize": 600,
             "apikey": TD_API_KEY,
+            "timezone": "Etc/UTC",  # фикс таймзоны для стабильных 4H/1D свечей
         }
         r = requests.get(f"{TD_BASE}/time_series", params=params, timeout=TD_TIMEOUT)
         if r.status_code != 200:
@@ -557,27 +558,34 @@ def process_symbol(kind, name):
 
     # 1B) LIGHT — дополнительный кейс:
     #     только дневка в зоне + сильный pin-bar >=34% (4H может быть где угодно)
-    if not sent and z1 and strong1:
+    if (not sent) and z1 and strong1:
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z1, src), key):
             sent = True
 
     # 2) 1TF4H — зона только на 4H + свечной паттерн на 4H
-    if have4 and z4 and pat4 and not (z1 and z1 == z4):
+    if (not sent) and have4 and z4 and pat4 and not (z1 and z1 == z4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
     # 3) 1TF1D — зона только на 1D + свечной паттерн на 1D
-    if have1 and z1 and pat1 and not (z4 and z4 == z1):
+    if (not sent) and have1 and z1 and pat1 and not (z4 and z4 == z1):
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z1, src), key):
             sent = True
 
     if sent:
+        # общий DEBUG для всех тикеров и всех сигналов
+        print(
+            f"DEBUG {sym} "
+            f"4H: v={v4} z={z4} pat={pat4} "
+            f"1D: v={v1} z={z1} pat={pat1} strong1={strong1} src={src}",
+            flush=True
+        )
         debug_symbol(sym)
 
     return sent
