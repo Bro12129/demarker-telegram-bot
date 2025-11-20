@@ -40,14 +40,12 @@ TD_API_KEY       = os.getenv("TWELVEDATA_API_KEY", "")
 TD_BASE          = os.getenv("TWELVEDATA_BASE", "https://api.twelvedata.com")
 TD_TIMEOUT       = 15
 
-# лимиты TwelveData free: до ~8 req/min и ~800 в день
 TD_MINUTE_LIMIT  = int(os.getenv("TD_MINUTE_LIMIT", "8"))
 TD_DAILY_LIMIT   = int(os.getenv("TD_DAILY_LIMIT", "780"))
-# как часто реально обновлять данные по ТФ (по умолчанию достаточно для free-тарифа)
-TD_REFRESH_4H    = int(os.getenv("TD_REFRESH_4H", "7200"))   # 2 часа
-TD_REFRESH_1D    = int(os.getenv("TD_REFRESH_1D", "43200"))  # 12 часов
 
-# кэш TwelveData: (symbol, interval) -> (ts_fetch, data)
+TD_REFRESH_4H    = int(os.getenv("TD_REFRESH_4H", "7200"))
+TD_REFRESH_1D    = int(os.getenv("TD_REFRESH_1D", "43200"))
+
 TD_CACHE: Dict = {}
 TD_RATE = {"minute_start": 0.0, "minute_count": 0}
 
@@ -134,7 +132,6 @@ def _td_parse_time(s: str) -> Optional[int]:
     return None
 
 def fetch_td_candles(symbol: str, interval: str):
-    """Универсальный запрос к TwelveData с кэшем и лимитами."""
     if not TD_API_KEY:
         return None
     key = (symbol, interval)
@@ -154,7 +151,7 @@ def fetch_td_candles(symbol: str, interval: str):
             "interval": "4h" if interval == "4h" else "1day",
             "outputsize": 600,
             "apikey": TD_API_KEY,
-            "timezone": "Etc/UTC",  # фикс таймзоны для стабильных 4H/1D свечей
+            "timezone": "Etc/UTC",
         }
         r = requests.get(f"{TD_BASE}/time_series", params=params, timeout=TD_TIMEOUT)
         if r.status_code != 200:
@@ -252,7 +249,6 @@ def last_closed(series):
     return series[i] if i >= 0 else None
 
 def zone_of(v, tf: str):
-    """Определяем зону по разным порогам для 4H и 1D."""
     if v is None:
         return None
     if tf == "4H":
@@ -268,9 +264,6 @@ def zone_of(v, tf: str):
 # ========== PIN-BAR (wick>=30%, направленный) ==========
 
 def pinbar_by_zone(o, idx, zone, pct=0.30):
-    """OB — верхний фитиль >= pct*body;
-       OS — нижний фитиль >= pct*body.
-    """
     if zone not in ("OB", "OS"):
         return False
     if not o or not (-len(o) <= idx < len(o)):
@@ -287,14 +280,12 @@ def pinbar_by_zone(o, idx, zone, pct=0.30):
         return lower >= pct * body
     return False
 
-# Engulfing с учётом последовательности: -3 и -2 одного цвета, -1 противоположного,
-# и -1 полностью покрывает диапазон -2. Работает по закрытым свечам.
 def engulfing_with_prior4(o):
     if len(o) < 3:
         return False
-    o2, h2, l2, c2 = o[-1][1:5]  # -1
-    o3, h3, l3, c3 = o[-2][1:5]  # -2
-    o4, h4, l4, c4 = o[-3][1:5]  # -3
+    o2, h2, l2, c2 = o[-1][1:5]
+    o3, h3, l3, c3 = o[-2][1:5]
+    o4, h4, l4, c4 = o[-3][1:5]
     bull2 = c2 >= o2
     bull3 = c3 >= o3
     bull4 = c4 >= o4
@@ -304,11 +295,6 @@ def engulfing_with_prior4(o):
     return bull or bear
 
 def candle_pattern(o, zone):
-    """
-    Свечной паттерн:
-      - pin-bar по зоне (wick>=30% и направление по зоне)
-      - ИЛИ engulfing_with_prior4 по последним трём закрытым свечам.
-    """
     o2 = closed_ohlc(o)
     if len(o2) < 3:
         return False
@@ -319,33 +305,20 @@ def candle_pattern(o, zone):
     has_eng = engulfing_with_prior4(o2)
     return has_pin or has_eng
 
-# ================= STRONG PIN-BAR 1D (>=34%) =====================
-
 def strong_pinbar_1d(o, zone, pct=0.34):
-    """
-    Сильный дневной pin-bar:
-      - фитиль >= pct * body
-      - направление строго по зоне:
-            OS → нижний фитиль
-            OB → верхний фитиль
-    """
     o2 = closed_ohlc(o)
     if len(o2) < 1 or zone not in ("OB", "OS"):
         return False
-
     o_, h_, l_, c_ = o2[-1][1:5]
     body = abs(c_ - o_)
     if body <= 0:
         return False
-
     upper = h_ - max(o_, c_)
     lower = min(o_, c_) - l_
-
     if zone == "OB":
         return upper >= pct * body
     if zone == "OS":
         return lower >= pct * body
-
     return False
 
 # ================= FORMAT =====================
@@ -367,7 +340,6 @@ def to_display(sym: str) -> str:
 def format_signal(symbol, sig, zone, src):
     arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
     status = "⚡" if sig == "LIGHT" else ""
-    # src: "BB" (Bybit) или "TD" (TwelveData)
     return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
 # ================= BYBIT =====================
@@ -403,8 +375,7 @@ def fx_to_td(sym: str) -> str:
         return s[:3] + "/" + s[3:]
     return s
 
-def ru_to_td(sym: str) -> str:
-    """IMOEX.ME -> IMOEX:MOEX, GAZP.ME -> GAZP:MOEX."""
+def ru_to_td(sym: str):
     u = sym.upper()
     if u.endswith(".ME"):
         base = u.split(".")[0]
@@ -443,35 +414,28 @@ FX = ["EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"]
 # ================= FETCH ROUTERS =====================
 
 def fetch_crypto(base, interval):
-    """Только Bybit для крипты; без TwelveData."""
     bb_lin = base + "USDT"
     d = fetch_bybit_klines(bb_lin, interval, "linear")
     if d: return d, bb_lin, "BB"
-
     bb_perp = base + "PERP"
     d = fetch_bybit_klines(bb_perp, interval, "linear")
     if d: return d, bb_perp, "BB"
-
     d = fetch_bybit_klines(bb_lin, interval, "spot")
     if d: return d, bb_lin, "BB"
-
     return None, base, "BB"
 
 def fetch_other(sym, interval):
-    # 1) Все ...USDT (индексы, металлы, энергия): только Bybit
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
         return None, sym, "BB"
 
-    # 2) FX 6-символьные: TwelveData FOREX
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         td_sym = fx_to_td(sym)
         d = fetch_td_candles(td_sym, interval)
         return d, sym, "TD"
 
-    # 3) Акции, включая RU: TwelveData STOCKS
     td_sym = ru_to_td(sym) if sym.upper().endswith(".ME") else sym.upper()
     d = fetch_td_candles(td_sym, interval)
     return d, sym, "TD"
@@ -489,16 +453,6 @@ def build_plan():
     for x in RU_STOCKS:  plan.append(("OTHER", x))
     return plan
 
-# ================= SERVICE =====================
-
-def debug_symbol(sym):
-    """Служебное сообщение после отправки сигнала (без стратегии)."""
-    try:
-        msg = f"SERVICE {to_display(sym)} валид"
-        _broadcast_signal(msg, f"SERVICE|{sym}|{int(time.time())}")
-    except:
-        pass
-
 # ================= CORE =====================
 
 def process_symbol(kind, name):
@@ -512,7 +466,6 @@ def process_symbol(kind, name):
 
     have4 = bool(k4_raw); have1 = bool(k1_raw)
     if not have4 and not have1:
-        # Только в логи, в Telegram не идёт
         print(f"WARN: no data for {name} ({kind})", flush=True)
         return False
 
@@ -520,6 +473,7 @@ def process_symbol(kind, name):
     k1 = closed_ohlc(k1_raw) if have1 else None
     if have4 and not k4: have4 = False
     if have1 and not k1: have1 = False
+
     if not have4 and not have1:
         print(f"WARN: no closed bars for {name} ({kind})", flush=True)
         return False
@@ -535,7 +489,6 @@ def process_symbol(kind, name):
     pat4 = candle_pattern(k4, z4) if have4 else False
     pat1 = candle_pattern(k1, z1) if have1 else False
 
-    # сильный дневной pin-bar (>=34% по зоне)
     strong1 = False
     if have1 and z1:
         strong1 = strong_pinbar_1d(k1, z1, pct=0.34)
@@ -549,44 +502,37 @@ def process_symbol(kind, name):
 
     sent = False
 
-    # 1A) LIGHT — 4H и 1D в одной зоне + свечной паттерн на одном из ТФ
     if z4 and z1 and z4 == z1 and (pat4 or pat1):
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
-    # 1B) LIGHT — дополнительный кейс:
-    #     только дневка в зоне + сильный pin-bar >=34% (4H может быть где угодно)
     if (not sent) and z1 and strong1:
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z1, src), key):
             sent = True
 
-    # 2) 1TF4H — зона только на 4H + свечной паттерн на 4H
     if (not sent) and have4 and z4 and pat4 and not (z1 and z1 == z4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
-    # 3) 1TF1D — зона только на 1D + свечной паттерн на 1D
     if (not sent) and have1 and z1 and pat1 and not (z4 and z4 == z1):
         sig = "1TF1D"
-        key = f"{sym}|{sig}|{z1}|{open1}|{src}"
+        key = f"{sym}|{"sig"}|{z1}|{open1}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z1, src), key):
             sent = True
 
     if sent:
-        # общий DEBUG для всех тикеров и всех сигналов
         print(
             f"DEBUG {sym} "
             f"4H: v={v4} z={z4} pat={pat4} "
             f"1D: v={v1} z={z1} pat={pat1} strong1={strong1} src={src}",
             flush=True
         )
-        debug_symbol(sym)
 
     return sent
 
@@ -598,12 +544,6 @@ def main():
     if plan_preview:
         print(f"Loaded {len(plan_preview)} symbols for scan.", flush=True)
         print(f"First symbol checked: {plan_preview[0][1]}", flush=True)
-
-    try:
-        _broadcast_signal("START", f"START|{int(time.time())}")
-        save_state(STATE_PATH, STATE)
-    except:
-        pass
 
     while True:
         plan = build_plan()
