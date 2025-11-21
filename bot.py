@@ -1,7 +1,7 @@
 # bot.py — Bybit + TwelveData (резерв с лимитами)
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
-#   ⚡        — 4H & 1D same zone + pin-bar / engulfing
+#   ⚡        — 4H & 1D same zone + pin-bar / engulfing (на одном из ТФ)
 #   1TF4H    — зона + свечной паттерн (pin-bar или engulfing) только на 4H
 #   1TF1D    — зона + свечной паттерн (pin-bar или engulfing) только на 1D
 
@@ -217,6 +217,10 @@ def _broadcast_signal(text: str, key: str) -> bool:
 # ================= CLOSED BARS =====================
 
 def closed_ohlc(ohlc: Optional[List[List[float]]]):
+    """
+    Возвращаем только закрытые свечи:
+    убираем последнюю (нулевую, потенциально незакрытую) свечу.
+    """
     if not ohlc or len(ohlc) < 2:
         return []
     return ohlc[:-1]
@@ -224,6 +228,9 @@ def closed_ohlc(ohlc: Optional[List[List[float]]]):
 # ================= INDICATORS =====================
 
 def demarker_series(o, length):
+    """
+    DeMarker считается по массиву уже закрытых свечей (минус первые и далее).
+    """
     if not o or len(o) < length + 1:
         return None
     highs = [x[2] for x in o]
@@ -248,6 +255,10 @@ def last_closed(series):
     return series[i] if i >= 0 else None
 
 def zone_of(v, tf: str):
+    """
+    Зона по последнему значению DeM:
+    v — значение DeM на последней закрытой свече (минус первая).
+    """
     if v is None:
         return None
     if tf == "4H":
@@ -263,62 +274,83 @@ def zone_of(v, tf: str):
 # ========== PIN-BAR (wick>=30%, направленный) ==========
 
 def pinbar_by_zone(o, idx, zone, pct=0.30):
+    """
+    Проверка pin-bar на уже закрытой свече:
+      - idx = -1 => всегда минус первая свеча в массиве закрытых свечей.
+      - zone = "OB" → верхний фитиль >= pct * body
+      - zone = "OS" → нижний фитиль >= pct * body
+    """
     if zone not in ("OB", "OS"):
         return False
     if not o or not (-len(o) <= idx < len(o)):
         return False
+
     o_, h_, l_, c_ = o[idx][1:5]
     body = abs(c_ - o_)
     if body <= 0:
         return False
+
     upper = h_ - max(o_, c_)
     lower = min(o_, c_) - l_
+
     if zone == "OB":
         return upper >= pct * body
     if zone == "OS":
         return lower >= pct * body
     return False
 
+# ========== ENGULFING (последовательность из трёх свечей) ==========
+
 def engulfing_with_prior4(o):
-    if len(o) < 3:
+    """
+    Engulfing по закрытым свечам:
+      - используем три последние закрытые свечи: -3, -2, -1.
+      - -3 и -2 одного цвета,
+      - -1 противоположного цвета,
+      - тело -1 полностью покрывает тело -2 (cover).
+    """
+    if not o or len(o) < 3:
         return False
+
+    # -1 (последняя закрытая)
     o2, h2, l2, c2 = o[-1][1:5]
+    # -2
     o3, h3, l3, c3 = o[-2][1:5]
+    # -3
     o4, h4, l4, c4 = o[-3][1:5]
+
     bull2 = c2 >= o2
     bull3 = c3 >= o3
     bull4 = c4 >= o4
+
+    # тело -1 накрывает тело -2
     cover = (min(o2, c2) <= min(o3, c3)) and (max(o2, c2) >= max(o3, c3))
+
+    # бычий engulfing: -3 и -2 медвежьи, -1 бычий
     bull = bull2 and (not bull3) and (not bull4) and cover
+    # медвежий engulfing: -3 и -2 бычьи, -1 медвежий
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
 
+# ========== ОБЩИЙ ПАТТЕРН (PEEP-фитиль ИЛИ ENGULFING) ==========
+
 def candle_pattern(o, zone):
-    o2 = closed_ohlc(o)
-    if len(o2) < 3:
+    """
+    Свечной паттерн на последней закрытой свече (минус первой):
+      - массив o — УЖЕ только закрытые свечи (через closed_ohlc).
+      - zone — "OB" или "OS".
+      - паттерн = pin-bar по зоне (wick>=30%) ИЛИ engulfing_with_prior4.
+    """
+    if not o or len(o) < 3:
         return False
     if zone not in ("OB", "OS"):
         return False
 
-    has_pin = pinbar_by_zone(o2, -1, zone, 0.30)
-    has_eng = engulfing_with_prior4(o2)
+    # pin-bar по минус первой свече
+    has_pin = pinbar_by_zone(o, -1, zone, 0.30)
+    # engulfing по трем последним закрытым свечам
+    has_eng = engulfing_with_prior4(o)
     return has_pin or has_eng
-
-def strong_pinbar_1d(o, zone, pct=0.34):
-    o2 = closed_ohlc(o)
-    if len(o2) < 1 or zone not in ("OB", "OS"):
-        return False
-    o_, h_, l_, c_ = o2[-1][1:5]
-    body = abs(c_ - o_)
-    if body <= 0:
-        return False
-    upper = h_ - max(o_, c_)
-    lower = min(o_, c_) - l_
-    if zone == "OB":
-        return upper >= pct * body
-    if zone == "OS":
-        return lower >= pct * body
-    return False
 
 # ================= FORMAT =====================
 
@@ -424,17 +456,20 @@ def fetch_crypto(base, interval):
     return None, base, "BB"
 
 def fetch_other(sym, interval):
+    # 1) Все ...USDT (индексы, металлы, энергия): только Bybit
     if sym.endswith("USDT"):
         d = fetch_bybit_klines(sym, interval, "linear")
         if d:
             return d, sym, "BB"
         return None, sym, "BB"
 
+    # 2) FX 6-символьные: TwelveData FOREX
     if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
         td_sym = fx_to_td(sym)
         d = fetch_td_candles(td_sym, interval)
         return d, sym, "TD"
 
+    # 3) Акции, включая RU: TwelveData STOCKS
     td_sym = ru_to_td(sym) if sym.upper().endswith(".ME") else sym.upper()
     d = fetch_td_candles(td_sym, interval)
     return d, sym, "TD"
@@ -456,6 +491,7 @@ def build_plan():
 
 def process_symbol(kind, name):
 
+    # Запрос сырых свечей (включая текущую нулевую)
     if kind == "CRYPTO":
         k4_raw, n4, s4 = fetch_crypto(name, KLINE_4H)
         k1_raw, n1, s1 = fetch_crypto(name, KLINE_1D)
@@ -468,8 +504,10 @@ def process_symbol(kind, name):
         print(f"WARN: no data for {name} ({kind})", flush=True)
         return False
 
+    # Обрезаем нулевую свечу: работаем только по закрытым
     k4 = closed_ohlc(k4_raw) if have4 else None
     k1 = closed_ohlc(k1_raw) if have1 else None
+
     if have4 and not k4: have4 = False
     if have1 and not k1: have1 = False
 
@@ -477,24 +515,25 @@ def process_symbol(kind, name):
         print(f"WARN: no closed bars for {name} ({kind})", flush=True)
         return False
 
+    # DeMarker по закрытым свечам
     d4 = demarker_series(k4, DEM_LEN) if have4 else None
     d1 = demarker_series(k1, DEM_LEN) if have1 else None
-    v4 = last_closed(d4) if d4 else None
-    v1 = last_closed(d1) if d1 else None
+
+    v4 = last_closed(d4) if d4 else None  # значение DeM на минус первой свече (4H)
+    v1 = last_closed(d1) if d1 else None  # значение DeM на минус первой свече (1D)
 
     z4 = zone_of(v4, "4H")
     z1 = zone_of(v1, "1D")
 
-    pat4 = candle_pattern(k4, z4) if have4 else False
-    pat1 = candle_pattern(k1, z1) if have1 else False
+    # Свечные паттерны считаются ТОЛЬКО по закрытым свечам,
+    # и pin-bar/engulfing всегда привязаны к минус первой свече в массиве k4/k1.
+    pat4 = candle_pattern(k4, z4) if have4 and z4 else False
+    pat1 = candle_pattern(k1, z1) if have1 and z1 else False
 
-    strong1 = False
-    if have1 and z1:
-        strong1 = strong_pinbar_1d(k1, z1, pct=0.34)
-
+    # Времена открытия последней закрытой свечи на каждом ТФ
     open4 = k4[-1][0] if have4 else None
     open1 = k1[-1][0] if have1 else None
-    dual  = max([x for x in (open4, open1) if x is not None])
+    dual  = max([x for x in (open4, open1) if x is not None]) if (open4 or open1) else None
 
     sym = n4 or n1 or name
     src = "BB" if "BB" in (s4, s1) else "TD"
@@ -526,7 +565,7 @@ def process_symbol(kind, name):
         print(
             f"DEBUG {sym} "
             f"4H: v={v4} z={z4} pat={pat4} "
-            f"1D: v={v1} z={z1} pat={pat1} strong1={strong1} src={src}",
+            f"1D: v={v1} z={z1} pat={pat1} src={src}",
             flush=True
         )
 
