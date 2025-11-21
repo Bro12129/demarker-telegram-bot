@@ -2,7 +2,6 @@
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
 #   ⚡        — 4H & 1D same zone + pin-bar / engulfing
-#              ИЛИ отдельный сильный 1D pin-bar (wick>=34% по зоне)
 #   1TF4H    — зона + свечной паттерн (pin-bar или engulfing) только на 4H
 #   1TF1D    — зона + свечной паттерн (pin-bar или engulfing) только на 1D
 
@@ -502,27 +501,24 @@ def process_symbol(kind, name):
 
     sent = False
 
+    # ⚡ — только если 4H и 1D в одной зоне + паттерн на одном из ТФ
     if z4 and z1 and z4 == z1 and (pat4 or pat1):
         sig = "LIGHT"
         key = f"{sym}|{sig}|{z4}|{dual}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
-    if (not sent) and z1 and strong1:
-        sig = "LIGHT"
-        key = f"{sym}|{sig}|{z1}|{open1}|{src}"
-        if _broadcast_signal(format_signal(sym, sig, z1, src), key):
-            sent = True
-
+    # 1TF4H — зона только на 4H + паттерн на 4H
     if (not sent) and have4 and z4 and pat4 and not (z1 and z1 == z4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
+    # 1TF1D — зона только на 1D + паттерн на 1D
     if (not sent) and have1 and z1 and pat1 and not (z4 and z4 == z1):
         sig = "1TF1D"
-        key = f"{sym}|{"sig"}|{z1}|{open1}|{src}"
+        key = f"{sym}|{sig}|{z1}|{open1}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z1, src), key):
             sent = True
 
