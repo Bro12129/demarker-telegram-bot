@@ -1,7 +1,7 @@
 # bot.py — Bybit + TwelveData (резерв с лимитами)
 # Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
 # Signals:
-#   ⚡        — 4H & 1D same zone + pin-bar / engulfing (на одном из ТФ)
+#   ⚡        — 4H & 1D same zone + один из 4 спец-паттернов для молнии
 #   1TF4H    — зона + свечной паттерн (pin-bar или engulfing) только на 4H
 #   1TF1D    — зона + свечной паттерн (pin-bar или engulfing) только на 1D
 
@@ -266,12 +266,12 @@ def zone_of(v, tf: str):
     else:
         ob, os_ = DEM_OB_1D, DEM_OS_1D
     if v >= ob:
-        return "OB"
+        return "OB"  # зона перекупленности
     if v <= os_:
-        return "OS"
+        return "OS"  # зона перепроданности
     return None
 
-# ========== PIN-BAR (wick>=30%, направленный) ==========
+# ========== PIN-BAR (wick с направлением) ==========
 
 def pinbar_by_zone(o, idx, zone, pct=0.30):
     """
@@ -332,25 +332,122 @@ def engulfing_with_prior4(o):
     bear = (not bull2) and bull3 and bull4 and cover
     return bull or bear
 
-# ========== ОБЩИЙ ПАТТЕРН (PEEP-фитиль ИЛИ ENGULFING) ==========
+# ========== PYRAMIDAL (фитиль ≥85%) ==========
+
+def pyramidal_pattern(o, idx, zone, pct=0.85):
+    """
+    Пирамидальный паттерн:
+      - фитиль по направлению зоны ≥ pct от полной высоты свечи (high-low).
+      - тело маленькое (автоматически, если фитиль ≥85% общей длины).
+      - zone = "OS": длинный нижний фитиль,
+      - zone = "OB": длинный верхний фитиль.
+    """
+    if zone not in ("OB", "OS"):
+        return False
+    if not o or not (-len(o) <= idx < len(o)):
+        return False
+
+    o_, h_, l_, c_ = o[idx][1:5]
+    total = h_ - l_
+    if total <= 0:
+        return False
+
+    body  = abs(c_ - o_)
+    upper = h_ - max(o_, c_)
+    lower = min(o_, c_) - l_
+
+    if upper < 0 or lower < 0:
+        return False
+
+    if zone == "OB":
+        # пирамида сверху: длинный верхний фитиль
+        return upper >= pct * total
+    else:
+        # пирамида снизу: длинный нижний фитиль
+        return lower >= pct * total
+
+# ========== ЦВЕТОВОЙ РАЗВОРОТ (4-й паттерн, только дневка) ==========
+
+def color_flip_pattern_1d(o, zone):
+    """
+    4-й паттерн для молнии (только 1D):
+      - зона перепроданности: красная свеча → зелёная свеча.
+      - зона перекупленности: зелёная свеча → красная свеча.
+    Используем только закрытые свечи: -2 и -1.
+    """
+    if zone not in ("OB", "OS"):
+        return False
+    if not o or len(o) < 2:
+        return False
+
+    o_prev, _, _, c_prev = o[-2][1:5]
+    o_last, _, _, c_last = o[-1][1:5]
+
+    prev_green = c_prev >= o_prev
+    last_green = c_last >= o_last
+
+    if zone == "OS":
+        # было красное (нисходящее), стало зелёное
+        return (not prev_green) and last_green
+    else:  # "OB"
+        # было зелёное (восходящее), стало красное
+        return prev_green and (not last_green)
+
+# ========== ОБЩИЙ ПАТТЕРН (для обычных сигналов 1TF4H / 1TF1D) ==========
 
 def candle_pattern(o, zone):
     """
-    Свечной паттерн на последней закрытой свече (минус первой):
-      - массив o — УЖЕ только закрытые свечи (через closed_ohlc).
-      - zone — "OB" или "OS".
-      - паттерн = pin-bar по зоне (wick>=30%) ИЛИ engulfing_with_prior4.
+    Свечной паттерн на последней закрытой свече (минус первой)
+    для обычных сигналов 1TF4H / 1TF1D:
+      - pin-bar по зоне (wick>=40%) ИЛИ engulfing_with_prior4.
     """
     if not o or len(o) < 3:
         return False
     if zone not in ("OB", "OS"):
         return False
 
-    # pin-bar по минус первой свече
-    has_pin = pinbar_by_zone(o, -1, zone, 0.30)
-    # engulfing по трем последним закрытым свечам
+    # pin-bar по минус первой свече, порог 40% (фикс)
+    has_pin = pinbar_by_zone(o, -1, zone, 0.40)
+    # engulfing по трём последним закрытым свечам
     has_eng = engulfing_with_prior4(o)
     return has_pin or has_eng
+
+# ========== ПАТТЕРНЫ ДЛЯ МОЛНИИ (4 шт.) ==========
+
+def lightning_has_pattern(k4, z4, k1, z1) -> bool:
+    """
+    Четыре свечных паттерна для сигнала молнии:
+      1) Engulfing на 4H.
+      2) Engulfing на 1D.
+      3) Усиленный pin-bar (фитиль ≥50%) на 1D.
+      4) Цветовой разворот на 1D (красная→зелёная в зоне перепроданности,
+         зелёная→красная в зоне перекупленности).
+      5) Пирамидальный паттерн (фитиль ≥85%) на 4H или 1D.
+    Достаточно хотя бы одного из них.
+    """
+    # 1) engulfing на 4H
+    if z4 and k4 and len(k4) >= 3 and engulfing_with_prior4(k4):
+        return True
+
+    # 2) engulfing на 1D
+    if z1 and k1 and len(k1) >= 3 and engulfing_with_prior4(k1):
+        return True
+
+    # 3) усиленный pin-bar >=50% на 1D
+    if z1 and k1 and pinbar_by_zone(k1, -1, z1, 0.50):
+        return True
+
+    # 4) цветовой разворот на 1D
+    if z1 and k1 and color_flip_pattern_1d(k1, z1):
+        return True
+
+    # 5) пирамидальный паттерн (4H или 1D)
+    if z4 and k4 and pyramidal_pattern(k4, -1, z4):
+        return True
+    if z1 and k1 and pyramidal_pattern(k1, -1, z1):
+        return True
+
+    return False
 
 # ================= FORMAT =====================
 
@@ -525,8 +622,7 @@ def process_symbol(kind, name):
     z4 = zone_of(v4, "4H")
     z1 = zone_of(v1, "1D")
 
-    # Свечные паттерны считаются ТОЛЬКО по закрытым свечам,
-    # и pin-bar/engulfing всегда привязаны к минус первой свече в массиве k4/k1.
+    # Свечные паттерны для обычных 1TF-сигналов (pin-bar 40% / engulfing)
     pat4 = candle_pattern(k4, z4) if have4 and z4 else False
     pat1 = candle_pattern(k1, z1) if have1 and z1 else False
 
@@ -540,21 +636,22 @@ def process_symbol(kind, name):
 
     sent = False
 
-    # ⚡ — только если 4H и 1D в одной зоне + паттерн на одном из ТФ
-    if z4 and z1 and z4 == z1 and (pat4 or pat1):
-        sig = "LIGHT"
-        key = f"{sym}|{sig}|{z4}|{dual}|{src}"
-        if _broadcast_signal(format_signal(sym, sig, z4, src), key):
-            sent = True
+    # ⚡ — 4H и 1D в одной зоне + любой из 4 свечных паттернов для молнии
+    if z4 and z1 and z4 == z1:
+        if lightning_has_pattern(k4 if have4 else None, z4, k1 if have1 else None, z1):
+            sig = "LIGHT"
+            key = f"{sym}|{sig}|{z4}|{dual}|{src}"
+            if _broadcast_signal(format_signal(sym, sig, z4, src), key):
+                sent = True
 
-    # 1TF4H — зона только на 4H + паттерн на 4H
+    # 1TF4H — зона только на 4H + обычный паттерн на 4H
     if (not sent) and have4 and z4 and pat4 and not (z1 and z1 == z4):
         sig = "1TF4H"
         key = f"{sym}|{sig}|{z4}|{open4}|{src}"
         if _broadcast_signal(format_signal(sym, sig, z4, src), key):
             sent = True
 
-    # 1TF1D — зона только на 1D + паттерн на 1D
+    # 1TF1D — зона только на 1D + обычный паттерн на 1D
     if (not sent) and have1 and z1 and pat1 and not (z4 and z4 == z1):
         sig = "1TF1D"
         key = f"{sym}|{sig}|{z1}|{open1}|{src}"
