@@ -28,7 +28,7 @@ DEM_OS_1D        = float(os.getenv("DEM_OS_1D", "0.29"))
 KLINE_4H         = os.getenv("KLINE_4H", "4h")
 KLINE_1D         = os.getenv("KLINE_1D", "1d")
 
-POLL_SECONDS     = 60
+POLL_SECONDS     = 60  # сейчас не используется как раньше, но оставлен для совместимости
 
 BYBIT_BASE       = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 BB_KLINES        = f"{BYBIT_BASE}/v5/market/kline"
@@ -80,6 +80,9 @@ def gc_state(state: Dict, days=21):
         state["td_day"] = time.strftime("%Y%m%d", time.gmtime())
     if "td_count" not in state:
         state["td_count"] = 0
+    # индекс обхода плана тикеров для циклического опроса
+    if "plan_idx" not in state:
+        state["plan_idx"] = 0
 
 STATE = load_state(STATE_PATH)
 
@@ -671,21 +674,52 @@ def process_symbol(kind, name):
 # ================= MAIN =====================
 
 def main():
-    plan_preview = build_plan()
-    print(f"INFO: Symbols loaded: {len(plan_preview)}", flush=True)
-    if plan_preview:
-        print(f"Loaded {len(plan_preview)} symbols for scan.", flush=True)
-        print(f"First symbol checked: {plan_preview[0][1]}", flush=True)
+    plan = build_plan()
+    n = len(plan)
+    print(f"INFO: Symbols loaded: {n}", flush=True)
+    if plan:
+        print(f"Loaded {n} symbols for scan.", flush=True)
+        print(f"First symbol checked: {plan[0][1]}", flush=True)
+    else:
+        print("WARN: empty plan, nothing to scan.", flush=True)
 
+    idx = STATE.get("plan_idx", 0)
+    if idx >= n:
+        idx = 0
+
+    # Цикл: за один «квази-минутный» слот обрабатываем не более TD_MINUTE_LIMIT тикеров,
+    # затем ждём до конца минуты. Так мы укладываемся в лимит 8 тикеров в минуту.
     while True:
+        start = time.time()
         plan = build_plan()
-        for kind, name in plan:
-            process_symbol(kind, name)
-            time.sleep(1)
+        n = len(plan)
+        if n == 0:
+            time.sleep(60)
+            continue
+        if idx >= n:
+            idx = 0
 
+        processed = 0
+        # Обрабатываем до 8 тикеров (TD_MINUTE_LIMIT) за один слот
+        while processed < TD_MINUTE_LIMIT:
+            kind, name = plan[idx]
+            process_symbol(kind, name)
+            idx = (idx + 1) % n
+            processed += 1
+
+            # Промежуточная пауза, чтобы 8 тикеров уложились примерно в одну минуту
+            # 8 * 5 сек ≈ 40 сек + накладные — потом доспим до 60.
+            time.sleep(5)
+
+        STATE["plan_idx"] = idx
         gc_state(STATE, 21)
         save_state(STATE_PATH, STATE)
-        time.sleep(POLL_SECONDS)
+
+        elapsed = time.time() - start
+        # Досыпаем до ~60 секунд, чтобы не вылезать за «8 тикеров в минуту»
+        sleep_left = 60.0 - elapsed
+        if sleep_left > 0:
+            time.sleep(sleep_left)
 
 if __name__ == "__main__":
     main()
