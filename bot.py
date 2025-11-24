@@ -516,8 +516,7 @@ def ru_to_td(sym: str):
 # ================= TICKERS =====================
 
 CRYPTO = [
-    "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX",
-    "DOT","LINK","LTC","MATIC","TON","ATOM","NEAR","PEPE"
+    "BTC", "ETH", "SOL", "XRP"
 ]
 
 INDEX_PERP = [
@@ -629,7 +628,7 @@ def process_symbol(kind, name):
     pat4 = candle_pattern(k4, z4) if have4 and z4 else False
     pat1 = candle_pattern(k1, z1) if have1 and z1 else False
 
-    # Времена открытия последней закрытой свечи на каждом ТФ
+    # Времена открытия последней закрытой свече на каждом ТФ
     open4 = k4[-1][0] if have4 else None
     open1 = k1[-1][0] if have1 else None
     dual  = max([x for x in (open4, open1) if x is not None]) if (open4 or open1) else None
