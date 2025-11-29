@@ -1,9 +1,6 @@
-# bot.py — Bybit + TwelveData (резерв с лимитами)
-# Closed candles only, DeMarker(28), pin-bar (wick>=30% с направлением)
-# Signals:
-#   ⚡        — 4H & 1D same zone + один из 4 спец-паттернов для молнии
-#   1TF4H    — зона + свечной паттерн (pin-bar или engulfing) только на 4H
-#   1TF1D    — зона + свечной паттерн (pin-bar или engulfing) только на 1D
+# ============================
+# bot.py — FINAL VERSION (Bybit PERP ONLY + Lightning-Only Logic)
+# ============================
 
 import os, time, json, requests
 from typing import List, Dict, Optional
@@ -28,11 +25,12 @@ DEM_OS_1D        = float(os.getenv("DEM_OS_1D", "0.29"))
 KLINE_4H         = os.getenv("KLINE_4H", "4h")
 KLINE_1D         = os.getenv("KLINE_1D", "1d")
 
-POLL_SECONDS     = 60  # сейчас не используется как раньше, но оставлен для совместимости
+POLL_SECONDS     = 60
 
 BYBIT_BASE       = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 BB_KLINES        = f"{BYBIT_BASE}/v5/market/kline"
 BB_TIMEOUT       = 15
+BB_INST          = f"{BYBIT_BASE}/v5/market/instruments"
 
 # TwelveData
 TD_API_KEY       = os.getenv("TWELVEDATA_API_KEY", "")
@@ -80,117 +78,20 @@ def gc_state(state: Dict, days=21):
         state["td_day"] = time.strftime("%Y%m%d", time.gmtime())
     if "td_count" not in state:
         state["td_count"] = 0
-    # индекс обхода плана тикеров для циклического опроса
     if "plan_idx" not in state:
         state["plan_idx"] = 0
 
 STATE = load_state(STATE_PATH)
 
-def _init_td_state():
-    if "td_day" not in STATE or "td_count" not in STATE:
-        STATE["td_day"] = time.strftime("%Y%m%d", time.gmtime())
-        STATE["td_count"] = 0
-
-def _td_can_request() -> bool:
-    if not TD_API_KEY:
-        return False
-    _init_td_state()
-    now = time.time()
-    ms = TD_RATE["minute_start"]
-    if (now - ms) >= 60:
-        TD_RATE["minute_start"] = now
-        TD_RATE["minute_count"] = 0
-    if TD_RATE["minute_count"] >= TD_MINUTE_LIMIT:
-        return False
-    cur_day = time.strftime("%Y%m%d", time.gmtime())
-    if STATE.get("td_day") != cur_day:
-        STATE["td_day"] = cur_day
-        STATE["td_count"] = 0
-    if STATE.get("td_count", 0) >= TD_DAILY_LIMIT:
-        return False
-    return True
-
-def _td_mark_request():
-    now = time.time()
-    if TD_RATE["minute_start"] == 0:
-        TD_RATE["minute_start"] = now
-        TD_RATE["minute_count"] = 0
-    TD_RATE["minute_count"] += 1
-    cur_day = time.strftime("%Y%m%d", time.gmtime())
-    if STATE.get("td_day") != cur_day:
-        STATE["td_day"] = cur_day
-        STATE["td_count"] = 0
-    STATE["td_count"] = STATE.get("td_count", 0) + 1
-
-def _td_parse_time(s: str) -> Optional[int]:
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return int(dt.timestamp())
-        except:
-            continue
-    return None
-
-def fetch_td_candles(symbol: str, interval: str):
-    if not TD_API_KEY:
-        return None
-    key = (symbol, interval)
-    now = time.time()
-    refresh = TD_REFRESH_4H if interval == "4h" else TD_REFRESH_1D
-    if key in TD_CACHE:
-        ts0, data = TD_CACHE[key]
-        if (now - ts0) < refresh:
-            return data
-    if not _td_can_request():
-        if key in TD_CACHE:
-            return TD_CACHE[key][1]
-        return None
-    try:
-        params = {
-            "symbol": symbol,
-            "interval": "4h" if interval == "4h" else "1day",
-            "outputsize": 600,
-            "apikey": TD_API_KEY,
-            "timezone": "Etc/UTC",
-        }
-        r = requests.get(f"{TD_BASE}/time_series", params=params, timeout=TD_TIMEOUT)
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        if j.get("status") != "ok":
-            return None
-        values = j.get("values") or []
-        out = []
-        for v in values:
-            ts = _td_parse_time(v.get("datetime"))
-            if not ts:
-                continue
-            o = float(v["open"]); h = float(v["high"])
-            l = float(v["low"]);  c = float(v["close"])
-            if h <= 0 or l <= 0:
-                continue
-            out.append([ts, o, h, l, c])
-        if not out:
-            return None
-        out.sort(key=lambda x: x[0])
-        TD_CACHE[key] = (now, out)
-        _td_mark_request()
-        return out
-    except:
-        return None
-
-# ================= TELEGRAM =====================
+# ===================== TELEGRAM ========================
 
 def _chat_tokens() -> List[str]:
     out = []
-    if not TELEGRAM_CHAT:
-        return out
-    for x in TELEGRAM_CHAT.split(","):
-        x = x.strip()
-        if x.startswith("-100"):
-            out.append(x)
+    if TELEGRAM_CHAT:
+        for x in TELEGRAM_CHAT.split(","):
+            x = x.strip()
+            if x.startswith("-100"):
+                out.append(x)
     return out
 
 def tg_send_one(cid: str, text: str) -> bool:
@@ -217,13 +118,9 @@ def _broadcast_signal(text: str, key: str) -> bool:
             sent_any = True
     return sent_any
 
-# ================= CLOSED BARS =====================
+# ===================== HELPERS =========================
 
-def closed_ohlc(ohlc: Optional[List[List[float]]]):
-    """
-    Возвращаем только закрытые свечи:
-    убираем последнюю (нулевую, потенциально незакрытую) свечу.
-    """
+def closed_ohlc(ohlc):
     if not ohlc or len(ohlc) < 2:
         return []
     return ohlc[:-1]
@@ -231,9 +128,6 @@ def closed_ohlc(ohlc: Optional[List[List[float]]]):
 # ================= INDICATORS =====================
 
 def demarker_series(o, length):
-    """
-    DeMarker считается по массиву уже закрытых свечей (минус первые и далее).
-    """
     if not o or len(o) < length + 1:
         return None
     highs = [x[2] for x in o]
@@ -258,10 +152,6 @@ def last_closed(series):
     return series[i] if i >= 0 else None
 
 def zone_of(v, tf: str):
-    """
-    Зона по последнему значению DeM:
-    v — значение DeM на последней закрытой свече (минус первая).
-    """
     if v is None:
         return None
     if tf == "4H":
@@ -269,20 +159,14 @@ def zone_of(v, tf: str):
     else:
         ob, os_ = DEM_OB_1D, DEM_OS_1D
     if v >= ob:
-        return "OB"  # зона перекупленности
+        return "OB"
     if v <= os_:
-        return "OS"  # зона перепроданности
+        return "OS"
     return None
 
-# ========== PIN-BAR (wick с направлением) ==========
+# ================= PATTERNS =====================
 
 def pinbar_by_zone(o, idx, zone, pct=0.30):
-    """
-    Проверка pin-bar на уже закрытой свече:
-      - idx = -1 => всегда минус первая свеча в массиве закрытых свечей.
-      - zone = "OB" → верхний фитиль >= pct * body
-      - zone = "OS" → нижний фитиль >= pct * body
-    """
     if zone not in ("OB", "OS"):
         return False
     if not o or not (-len(o) <= idx < len(o)):
@@ -298,53 +182,29 @@ def pinbar_by_zone(o, idx, zone, pct=0.30):
 
     if zone == "OB":
         return upper >= pct * body
-    if zone == "OS":
+    else:
         return lower >= pct * body
-    return False
-
-# ========== ENGULFING (последовательность из трёх свечей) ==========
 
 def engulfing_with_prior4(o):
-    """
-    Engulfing по закрытым свечам:
-      - используем три последние закрытые свечи: -3, -2, -1.
-      - -3 и -2 одного цвета,
-      - -1 противоположного цвета,
-      - тело -1 полностью покрывает тело -2 (cover).
-    """
     if not o or len(o) < 3:
         return False
 
-    # -1 (последняя закрытая)
-    o2, h2, l2, c2 = o[-1][1:5]
-    # -2
-    o3, h3, l3, c3 = o[-2][1:5]
-    # -3
-    o4, h4, l4, c4 = o[-3][1:5]
+    o2, _, _, c2 = o[-1][1:5]
+    o3, _, _, c3 = o[-2][1:5]
+    o4, _, _, c4 = o[-3][1:5]
 
     bull2 = c2 >= o2
     bull3 = c3 >= o3
     bull4 = c4 >= o4
 
-    # тело -1 накрывает тело -2
     cover = (min(o2, c2) <= min(o3, c3)) and (max(o2, c2) >= max(o3, c3))
 
-    # бычий engulfing: -3 и -2 медвежьи, -1 бычий
     bull = bull2 and (not bull3) and (not bull4) and cover
-    # медвежий engulfing: -3 и -2 бычьи, -1 медвежий
     bear = (not bull2) and bull3 and bull4 and cover
+
     return bull or bear
 
-# ========== PYRAMIDAL (фитиль ≥85%) ==========
-
 def pyramidal_pattern(o, idx, zone, pct=0.85):
-    """
-    Пирамидальный паттерн:
-      - фитиль по направлению зоны ≥ pct от полной высоты свечи (high-low).
-      - тело маленькое (автоматически, если фитиль ≥85% общей длины).
-      - zone = "OS": длинный нижний фитиль,
-      - zone = "OB": длинный верхний фитиль.
-    """
     if zone not in ("OB", "OS"):
         return False
     if not o or not (-len(o) <= idx < len(o)):
@@ -355,29 +215,15 @@ def pyramidal_pattern(o, idx, zone, pct=0.85):
     if total <= 0:
         return False
 
-    body  = abs(c_ - o_)
     upper = h_ - max(o_, c_)
     lower = min(o_, c_) - l_
 
-    if upper < 0 or lower < 0:
-        return False
-
     if zone == "OB":
-        # пирамида сверху: длинный верхний фитиль
         return upper >= pct * total
     else:
-        # пирамида снизу: длинный нижний фитиль
         return lower >= pct * total
 
-# ========== ЦВЕТОВОЙ РАЗВОРОТ (4-й паттерн, только дневка) ==========
-
 def color_flip_pattern_1d(o, zone):
-    """
-    4-й паттерн для молнии (только 1D):
-      - зона перепроданности: красная свеча → зелёная свеча.
-      - зона перекупленности: зелёная свеча → красная свеча.
-    Используем только закрытые свечи: -2 и -1.
-    """
     if zone not in ("OB", "OS"):
         return False
     if not o or len(o) < 2:
@@ -390,115 +236,65 @@ def color_flip_pattern_1d(o, zone):
     last_green = c_last >= o_last
 
     if zone == "OS":
-        # было красное (нисходящее), стало зелёное
         return (not prev_green) and last_green
-    else:  # "OB"
-        # было зелёное (восходящее), стало красное
+    else:
         return prev_green and (not last_green)
 
-# ========== ОБЩИЙ ПАТТЕРН (для обычных сигналов 1TF4H / 1TF1D) ==========
-
 def candle_pattern(o, zone):
-    """
-    Свечной паттерн на последней закрытой свече (минус первой)
-    для обычных сигналов 1TF4H / 1TF1D:
-      - pin-bar по зоне (wick>=40%) ИЛИ engulfing_with_prior4.
-    """
     if not o or len(o) < 3:
         return False
     if zone not in ("OB", "OS"):
         return False
 
-    # pin-bar по минус первой свече, порог 40% (фикс)
     has_pin = pinbar_by_zone(o, -1, zone, 0.40)
-    # engulfing по трём последним закрытым свечам
     has_eng = engulfing_with_prior4(o)
     return has_pin or has_eng
 
-# ========== ПАТТЕРНЫ ДЛЯ МОЛНИИ (4 шт.) ==========
-
 def lightning_has_pattern(k4, z4, k1, z1) -> bool:
-    """
-    Четыре свечных паттерна для сигнала молнии:
-      1) Engulfing на 4H.
-      2) Engulfing на 1D.
-      3) Усиленный pin-bar (фитиль ≥50%) на 1D.
-      4) Цветовой разворот на 1D (красная→зелёная в зоне перепроданности,
-         зелёная→красная в зоне перекупленности).
-      5) Пирамидальный паттерн (фитиль ≥85%) на 4H или 1D.
-    Достаточно хотя бы одного из них.
-    """
-    # 1) engulfing на 4H
     if z4 and k4 and len(k4) >= 3 and engulfing_with_prior4(k4):
         return True
-
-    # 2) engulfing на 1D
     if z1 and k1 and len(k1) >= 3 and engulfing_with_prior4(k1):
         return True
-
-    # 3) усиленный pin-bar >=50% на 1D
     if z1 and k1 and pinbar_by_zone(k1, -1, z1, 0.50):
         return True
-
-    # 4) цветовой разворот на 1D
     if z1 and k1 and color_flip_pattern_1d(k1, z1):
         return True
-
-    # 5) пирамидальный паттерн (4H или 1D)
     if z4 and k4 and pyramidal_pattern(k4, -1, z4):
         return True
     if z1 and k1 and pyramidal_pattern(k1, -1, z1):
         return True
-
     return False
 
-# ================= FORMAT =====================
 
-def is_fx_sym(sym: str) -> bool:
-    s = "".join(ch for ch in sym.upper() if ch.isalpha())
-    return len(s) >= 6
+# ================= BYBIT PERPETUAL DISCOVERY =====================
 
-def to_display(sym: str) -> str:
-    s = sym.upper()
-    if s.endswith(".ME"):
-        return s
-    if s.endswith("USDT"):
-        return s[:-4] + "-USDT"
-    if is_fx_sym(s) and len(s) == 6:
-        return s + "-USD"
-    return s
+def get_bybit_perp_symbols():
+    """Load ALL perpetual contracts from Bybit (linear + inverse)."""
+    out = set()
+    for cat in ("linear", "inverse"):
+        try:
+            r = requests.get(
+                BB_INST,
+                params={"category": cat},
+                timeout=10
+            )
+            j = r.json()
+            lst = (j.get("result") or {}).get("list") or []
+            for it in lst:
+                if it.get("status") != "Trading":
+                    continue
+                ctype = it.get("contractType", "")
+                if "Perpetual" not in ctype:
+                    continue
+                sym = it.get("symbol")
+                if sym:
+                    out.add(sym)
+        except:
+            continue
+    return sorted(list(out))
 
-def format_signal(symbol, sig, zone, src):
-    arrow = "🟢↑" if zone == "OS" else ("🔴↓" if zone == "OB" else "")
-    status = "⚡" if sig == "LIGHT" else ""
-    return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
-# ================= BYBIT =====================
-
-def fetch_bybit_klines(symbol, interval, category, limit=600):
-    iv = "240" if interval == "4h" else ("D" if interval == "1d" else interval)
-    try:
-        r = requests.get(
-            BB_KLINES,
-            params={"category": category, "symbol": symbol, "interval": iv, "limit": limit},
-            timeout=BB_TIMEOUT
-        )
-        if r.status_code != 200:
-            return None
-        lst = (r.json().get("result") or {}).get("list") or []
-        out = []
-        for k in lst:
-            ts = int(k[0]); ts = ts // 1000 if ts > 10**12 else ts
-            o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
-            if h <= 0 or l <= 0:
-                continue
-            out.append([ts, o, h, l, c])
-        out.sort(key=lambda x: x[0])
-        return out
-    except:
-        return None
-
-# ================= TwelveData HELPERS =====================
+# ================= TwelveData helpers =====================
 
 def fx_to_td(sym: str) -> str:
     s = sym.upper()
@@ -513,164 +309,151 @@ def ru_to_td(sym: str):
         return f"{base}:MOEX"
     return u
 
-# ================= TICKERS =====================
+# ================= FORMAT =====================
 
-CRYPTO = [
-    "BTC", "ETH", "SOL", "XRP"
-]
+def is_fx_sym(sym: str) -> bool:
+    s = "".join(ch for ch in sym.upper() if ch.isalpha())
+    return len(s) >= 6
 
-INDEX_PERP = [
-    "US500USDT","US100USDT","US30USDT","VIXUSDT","DE40USDT",
-    "FR40USDT","UK100USDT","JP225USDT","HK50USDT","CN50USDT",
-    "AU200USDT","ES35USDT","IT40USDT"
-]
+def to_display(sym: str) -> str:
+    s = sym.upper()
+    if s.endswith(".ME"):
+        return s
+    if s.endswith("USDT"):
+        return s[:-4] + "-USDT"
+    return s
 
-METALS = ["XAUUSDT","XAGUSDT","XCUUSDT","XPTUSDT","XPDUSDT"]
-ENERGY = ["OILUSDT","BRENTUSDT","GASUSDT"]
+def format_signal(symbol, sig, zone, src):
+    arrow = "🔴↓" if zone == "OB" else ("🟢↑" if zone == "OS" else "")
+    status = "⚡" if sig == "LIGHT" else ""
+    return f"{to_display(symbol)} [{src}] {arrow}{status}"
 
-STOCKS = [
-    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRKB",
-    "AVGO","NFLX","AMD","JPM","V","MA","UNH","LLY","XOM","KO","PEP"
-]
+# ================= BYBIT FETCH =====================
 
-RU_STOCKS = [
-    "IMOEX.ME","RTSI.ME","GAZP.ME","SBER.ME","LKOH.ME","ROSN.ME","TATN.ME",
-    "ALRS.ME","GMKN.ME","YNDX.ME","MAGN.ME","MTSS.ME","CHMF.ME","AFLT.ME",
-    "PHOR.ME","MOEX.ME","BELU.ME","PIKK.ME","VTBR.ME","IRAO.ME"
-]
+def fetch_bybit_klines(symbol, interval):
+    iv = "240" if interval == "4h" else "D"
+    try:
+        r = requests.get(
+            BB_KLINES,
+            params={"category": "linear", "symbol": symbol, "interval": iv, "limit": 600},
+            timeout=10
+        )
+        j = r.json()
+        lst = (j.get("result") or {}).get("list") or []
+        out = []
+        for k in lst:
+            ts = int(k[0])
+            ts = ts // 1000 if ts > 10**12 else ts
+            o = float(k[1]); h = float(k[2])
+            l = float(k[3]); c = float(k[4])
+            if h <= 0 or l <= 0:
+                continue
+            out.append([ts, o, h, l, c])
+        out.sort(key=lambda x: x[0])
+        return out
+    except:
+        return None
 
-FX = ["EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"]
+# ================= PLAN BUILDER =====================
 
-# ================= FETCH ROUTERS =====================
-
-def fetch_crypto(base, interval):
-    bb_lin = base + "USDT"
-    d = fetch_bybit_klines(bb_lin, interval, "linear")
-    if d: return d, bb_lin, "BB"
-    bb_perp = base + "PERP"
-    d = fetch_bybit_klines(bb_perp, interval, "linear")
-    if d: return d, bb_perp, "BB"
-    d = fetch_bybit_klines(bb_lin, interval, "spot")
-    if d: return d, bb_lin, "BB"
-    return None, base, "BB"
-
-def fetch_other(sym, interval):
-    # 1) Все ...USDT (индексы, металлы, энергия): только Bybit
-    if sym.endswith("USDT"):
-        d = fetch_bybit_klines(sym, interval, "linear")
-        if d:
-            return d, sym, "BB"
-        return None, sym, "BB"
-
-    # 2) FX 6-символьные: TwelveData FOREX
-    if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
-        td_sym = fx_to_td(sym)
-        d = fetch_td_candles(td_sym, interval)
-        return d, sym, "TD"
-
-    # 3) Акции, включая RU: TwelveData STOCKS
-    td_sym = ru_to_td(sym) if sym.upper().endswith(".ME") else sym.upper()
-    d = fetch_td_candles(td_sym, interval)
-    return d, sym, "TD"
-
-# ================= PLAN =====================
+CORE_CRYPTO = ["BTC", "ETH", "SOL", "XRP"]
 
 def build_plan():
     plan = []
-    for x in CRYPTO:     plan.append(("CRYPTO", x))
-    for x in INDEX_PERP: plan.append(("OTHER", x))
-    for x in METALS:     plan.append(("OTHER", x))
-    for x in ENERGY:     plan.append(("OTHER", x))
-    for x in STOCKS:     plan.append(("OTHER", x))
-    for x in FX:         plan.append(("OTHER", x))
-    for x in RU_STOCKS:  plan.append(("OTHER", x))
+    # 1) Core crypto (original logic)
+    for x in CORE_CRYPTO:
+        plan.append(("CRYPTO_CORE", x))
+
+    # 2) All Bybit PERP contracts (new logic)
+    all_perp = get_bybit_perp_symbols()
+    for sym in all_perp:
+        # Skip symbols like BTCUSDT we already handle manually
+        if sym.startswith("BTC") or sym.startswith("ETH") or sym.startswith("SOL") or sym.startswith("XRP"):
+            continue
+        plan.append(("BYBIT_PERP", sym))
+
     return plan
 
-# ================= CORE =====================
+
+# ================= PROCESS SYMBOL =====================
 
 def process_symbol(kind, name):
-
-    # Запрос сырых свечей (включая текущую нулевую)
-    if kind == "CRYPTO":
-        k4_raw, n4, s4 = fetch_crypto(name, KLINE_4H)
-        k1_raw, n1, s1 = fetch_crypto(name, KLINE_1D)
+    if kind == "CRYPTO_CORE":
+        # Fetch standard linear symbol (BTC → BTCUSDT)
+        bb_sym = name + "USDT"
+        k4 = fetch_bybit_klines(bb_sym, KLINE_4H)
+        k1 = fetch_bybit_klines(bb_sym, KLINE_1D)
+        src = "BB"
     else:
-        k4_raw, n4, s4 = fetch_other(name, KLINE_4H)
-        k1_raw, n1, s1 = fetch_other(name, KLINE_1D)
+        # BYBIT_PERP — full symbol already
+        bb_sym = name
+        k4 = fetch_bybit_klines(bb_sym, KLINE_4H)
+        k1 = fetch_bybit_klines(bb_sym, KLINE_1D)
+        src = "BB"
 
-    have4 = bool(k4_raw); have1 = bool(k1_raw)
-    if not have4 and not have1:
-        print(f"WARN: no data for {name} ({kind})", flush=True)
+    if not k4 and not k1:
         return False
 
-    # Обрезаем нулевую свечу: работаем только по закрытым
-    k4 = closed_ohlc(k4_raw) if have4 else None
-    k1 = closed_ohlc(k1_raw) if have1 else None
+    k4c = closed_ohlc(k4) if k4 else None
+    k1c = closed_ohlc(k1) if k1 else None
 
-    if have4 and not k4: have4 = False
-    if have1 and not k1: have1 = False
+    have4 = bool(k4c)
+    have1 = bool(k1c)
 
-    if not have4 and not have1:
-        print(f"WARN: no closed bars for {name} ({kind})", flush=True)
-        return False
+    d4 = demarker_series(k4c, DEM_LEN) if have4 else None
+    d1 = demarker_series(k1c, DEM_LEN) if have1 else None
 
-    # DeMarker по закрытым свечам
-    d4 = demarker_series(k4, DEM_LEN) if have4 else None
-    d1 = demarker_series(k1, DEM_LEN) if have1 else None
-
-    v4 = last_closed(d4) if d4 else None  # значение DeM на минус первой свече (4H)
-    v1 = last_closed(d1) if d1 else None  # значение DeM на минус первой свече (1D)
+    v4 = last_closed(d4) if d4 else None
+    v1 = last_closed(d1) if d1 else None
 
     z4 = zone_of(v4, "4H")
     z1 = zone_of(v1, "1D")
 
-    # Свечные паттерны для обычных 1TF-сигналов (pin-bar 40% / engulfing)
-    pat4 = candle_pattern(k4, z4) if have4 and z4 else False
-    pat1 = candle_pattern(k1, z1) if have1 and z1 else False
+    # ========== CORE crypto (old logic) ==========
+    if kind == "CRYPTO_CORE":
+        sent = False
 
-    # Времена открытия последней закрытой свече на каждом ТФ
-    open4 = k4[-1][0] if have4 else None
-    open1 = k1[-1][0] if have1 else None
-    dual  = max([x for x in (open4, open1) if x is not None]) if (open4 or open1) else None
+        pat4 = candle_pattern(k4c, z4) if have4 and z4 else False
+        pat1 = candle_pattern(k1c, z1) if have1 and z1 else False
 
-    sym = n4 or n1 or name
-    src = "BB" if "BB" in (s4, s1) else "TD"
+        open4 = k4c[-1][0] if have4 else None
+        open1 = k1c[-1][0] if have1 else None
+        dual  = max([x for x in (open4, open1) if x]) if (open4 or open1) else None
 
-    sent = False
+        # ⚡ same-zone lightning
+        if z4 and z1 and z4 == z1:
+            if lightning_has_pattern(k4c, z4, k1c, z1):
+                key = f"{bb_sym}|LIGHT|{z4}|{dual}|BB"
+                if _broadcast_signal(format_signal(bb_sym, "LIGHT", z4, src), key):
+                    return True
 
-    # ⚡ — 4H и 1D в одной зоне + любой из 4 свечных паттернов для молнии
-    if z4 and z1 and z4 == z1:
-        if lightning_has_pattern(k4 if have4 else None, z4, k1 if have1 else None, z1):
-            sig = "LIGHT"
-            key = f"{sym}|{sig}|{z4}|{dual}|{src}"
-            if _broadcast_signal(format_signal(sym, sig, z4, src), key):
-                sent = True
+        # 1TF4H
+        if have4 and z4 and pat4 and not (z1 and z1 == z4):
+            key = f"{bb_sym}|1TF4H|{z4}|{open4}|BB"
+            if _broadcast_signal(format_signal(bb_sym, "1TF4H", z4, src), key):
+                return True
 
-    # 1TF4H — зона только на 4H + обычный паттерн на 4H
-    if (not sent) and have4 and z4 and pat4 and not (z1 and z1 == z4):
-        sig = "1TF4H"
-        key = f"{sym}|{sig}|{z4}|{open4}|{src}"
-        if _broadcast_signal(format_signal(sym, sig, z4, src), key):
-            sent = True
+        # 1TF1D
+        if have1 and z1 and pat1 and not (z4 and z4 == z1):
+            key = f"{bb_sym}|1TF1D|{z1}|{open1}|BB"
+            if _broadcast_signal(format_signal(bb_sym, "1TF1D", z1, src), key):
+                return True
 
-    # 1TF1D — зона только на 1D + обычный паттерн на 1D
-    if (not sent) and have1 and z1 and pat1 and not (z4 and z4 == z1):
-        sig = "1TF1D"
-        key = f"{sym}|{sig}|{z1}|{open1}|{src}"
-        if _broadcast_signal(format_signal(sym, sig, z1, src), key):
-            sent = True
+        return False
 
-    if sent:
-        print(
-            f"DEBUG {sym} "
-            f"4H: v={v4} z={z4} pat={pat4} "
-            f"1D: v={v1} z={z1} pat={pat1} src={src}",
-            flush=True
-        )
+    # ========== BYBIT PERP LOGIC (new lightning-only) ==========
 
-    return sent
+    # Only lightning:
+    if z4 == "OB" and z1 == "OB":
+        if lightning_has_pattern(k4c, z4, k1c, z1):
+            # SELL ONLY
+            key = f"{bb_sym}|LIGHT|OB|{int(time.time())}|BB"
+            return _broadcast_signal(format_signal(bb_sym, "LIGHT", "OB", src), key)
 
-# ================= MAIN =====================
+    return False
+
+
+# ================= MAIN LOOP =====================
 
 def main():
     plan = build_plan()
@@ -679,35 +462,24 @@ def main():
     if plan:
         print(f"Loaded {n} symbols for scan.", flush=True)
         print(f"First symbol checked: {plan[0][1]}", flush=True)
-    else:
-        print("WARN: empty plan, nothing to scan.", flush=True)
 
     idx = STATE.get("plan_idx", 0)
     if idx >= n:
         idx = 0
 
-    # Цикл: за один «квази-минутный» слот обрабатываем не более TD_MINUTE_LIMIT тикеров,
-    # затем ждём до конца минуты. Так мы укладываемся в лимит 8 тикеров в минуту.
     while True:
         start = time.time()
         plan = build_plan()
         n = len(plan)
-        if n == 0:
-            time.sleep(60)
-            continue
         if idx >= n:
             idx = 0
 
         processed = 0
-        # Обрабатываем до 8 тикеров (TD_MINUTE_LIMIT) за один слот
         while processed < TD_MINUTE_LIMIT:
             kind, name = plan[idx]
             process_symbol(kind, name)
             idx = (idx + 1) % n
             processed += 1
-
-            # Промежуточная пауза, чтобы 8 тикеров уложились примерно в одну минуту
-            # 8 * 5 сек ≈ 40 сек + накладные — потом доспим до 60.
             time.sleep(5)
 
         STATE["plan_idx"] = idx
@@ -715,7 +487,6 @@ def main():
         save_state(STATE_PATH, STATE)
 
         elapsed = time.time() - start
-        # Досыпаем до ~60 секунд, чтобы не вылезать за «8 тикеров в минуту»
         sleep_left = 60.0 - elapsed
         if sleep_left > 0:
             time.sleep(sleep_left)
